@@ -1,0 +1,776 @@
+---
+title: "PC_Analysis"
+author: "Judy Liang"
+date: "2024-11-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+
+
+# Load necessary packages
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(variancePartition)
+
+#load necessary data
+load("fc_cb_samples.RData")
+load("ALS_filtered_combined_cortex.RData")
+load("~/Downloads/april_5_gene_matrix.RData")
+# read in Picard tools file 
+picard_tools <- read.table("/Users/judyliang/Downloads/multiqc_picard_RnaSeqMetrics.txt", header = TRUE, sep = "\t")
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+#identifying the sample ids to extract from genes_tpm to do PCA
+
+#extract sample ids of only cerebellum and frontal cortex samples
+sample_ids <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal")%>%
+  pull(external_sample_id)
+
+intersect(sample_ids, colnames(genes_tpm)) %>% length()
+
+selected_samples_gene_tpm <- genes_tpm[, colnames(genes_tpm) %in% sample_ids]
+
+selected_samples_gene_tpm
+
+#find the lowly expressed genes (to remove later)
+low_expressed_genes <- rowMeans(selected_samples_gene_tpm) < 1
+table(low_expressed_genes)
+
+#making sure columns in gene_tpm match metadata (which contains only fc and cb samples)
+metadata <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal")
+rownames(metadata) <- metadata$external_sample_id
+metadata <- metadata[colnames(selected_samples_gene_tpm),]
+
+```
+
+```{r}
+#log transform tpm values for PCA
+log_genes_tpm <- log2(selected_samples_gene_tpm + 1)
+zero_variance_genes <- apply(selected_samples_gene_tpm, 1, function(x) var(x) == 0) 
+
+#remove lowly transcribed genes (mean tpm >1) -> 10-20k
+filtered_genes_tpm <- log_genes_tpm[!zero_variance_genes & !low_expressed_genes, ] 
+
+pca_result <- prcomp(t(filtered_genes_tpm), scale. = TRUE, center = TRUE)
+
+summary(pca_result)
+
+plot(pca_result)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r}
+library(ggfortify)
+autoplot(pca_result) 
+autoplot(pca_result, color = "sample_source", data = metadata)
+```
+
+```{r}
+#creating subsets of pca result into cerebellum samples and frontal cortex samples
+pca_df <- as.data.frame(pca_result$x)
+pca_df <- pca_df %>%
+ rownames_to_column(var = "sample_id")
+
+#creating pca df specific to cerebellum samples
+pca_df_cerebellum <- as.data.frame(pca_result$x) %>%
+  rownames_to_column(var = "sample_id") %>%
+  inner_join(metadata, by = c("sample_id" = "external_sample_id")) %>%
+  filter(sample_source == "Cerebellum")
+
+#creating pca df specific to frontal cortex samples
+pca_df_frontal_cortex <- as.data.frame(pca_result$x) %>%
+  rownames_to_column(var = "sample_id") %>%
+  inner_join(metadata, by = c("sample_id" = "external_sample_id")) %>%
+  filter(sample_source == "Cortex_Frontal")
+```
+
+
+```{r}
+#frontal cortex: finding mean and SD to find outliers
+pc1_fc_mean <- mean(pca_df_frontal_cortex$PC1)
+pc1_fc_sd <- sd(pca_df_frontal_cortex$PC1)
+pc2_fc_mean <- mean(pca_df_frontal_cortex$PC2)
+pc2_fc_sd <- sd(pca_df_frontal_cortex$PC2)
+
+#create column that identifies which points are outliers vs normal according to 3*SD boundaries.
+pca_df_frontal_cortex <- pca_df_frontal_cortex %>%
+  mutate(outlier = ifelse(abs(PC1 - pc1_fc_mean) > 3 * pc1_fc_sd  | 
+                          abs(PC2 - pc2_fc_mean) > 3 * pc2_fc_sd, "Outlier", "Normal"))
+
+#plot PC1 against PC2 
+ggplot(pca_df_frontal_cortex, aes(x = PC1, y = PC2, color = outlier)) +
+  geom_point() +
+  scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+  labs(title = "Frontal Cortex PCA Plot (PC1 vs PC2)", x = "PC1", y = "PC2") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+```
+
+
+```{r}
+#cerebellum: finding mean and SD to find outliers
+pc1_cb_mean <- mean(pca_df_cerebellum$PC1)
+pc1_cb_sd <- sd(pca_df_cerebellum$PC1)
+pc2_cb_mean <- mean(pca_df_cerebellum$PC2)
+pc2_cb_sd <- sd(pca_df_cerebellum$PC2)
+
+#create column that identifies which points are outliers vs normal according to 3*SD boundaries.
+pca_df_cerebellum<- pca_df_cerebellum %>%
+  mutate(outlier = ifelse(abs(PC1 - pc1_cb_mean) > 3 * pc1_cb_sd  | 
+                          abs(PC2 - pc2_cb_mean) > 3 * pc2_cb_sd, "Outlier", "Normal"))
+#plot PC1 against PC2 
+ggplot(pca_df_cerebellum, aes(x = PC1, y = PC2, color = outlier)) +
+  geom_point() +
+  scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+  labs(title = "Cerebellum PCA Plot (PC1 vs PC2)", x = "PC1", y = "PC2") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+,
+
+```{r}
+#removing FC samples that are based on values greater than 3 SD away from the mean
+outliers_fc <- pca_df_frontal_cortex %>%
+  filter(outlier == "Outlier") %>%
+  pull(sample_id)
+
+outliers_fc #7 samples
+
+ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+  filter(!external_sample_id %in% outliers_fc) #2853 to 2846 samples
+
+#removing CB samples that are based on values greater than 3 SD away from mean 
+outliers_cb <- pca_df_cerebellum %>%
+  filter(outlier == "Outlier") %>%
+  pull(sample_id)
+
+outliers_cb # 5 samples
+ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+  filter(!external_sample_id %in% outliers_cb) #2846 samples to 2841 samples
+
+```
+
+
+
+```{r}
+# # other ways to find outliers for frontal cortex
+# # Calculate the center (mean) of the PCA scores
+# center_fc <- colMeans(pca_df_frontal_cortex[, 2:3])  # For PC1 and PC2
+# 
+# # Calculate Euclidean distances from the center for each sample
+# distances_fc <- sqrt(rowSums((pca_df_frontal_cortex[, 2:3] - center_fc)^2))
+# 
+# # Add the distances to the data frame
+# pca_df_frontal_cortex$distance <- distances_fc
+# 
+# # Plot the distances
+# ggplot(pca_df_frontal_cortex, aes(x = distance)) +
+#   geom_histogram(binwidth = 0.5, fill = "skyblue", color = "black") +
+#   labs(title = "Histogram of Distance from Center", x = "Distance from Center", y = "Frequency") +
+#   theme_classic()
+
+```
+
+```{r}
+# # define threshold (2 or 3 standard deviations from the mean?)
+# threshold_fc <- mean(distances_fc) + 3 * sd(distances_fc)
+# 
+# # Identify outliers
+# outliers_fc1 <- pca_df_frontal_cortex[distances_fc > threshold_fc, ]
+# outliers_fc1
+# 
+# #"CGND-HRA-00243" "CGND-HRA-00244" "CGND-HRA-00245" "CGND-HRA-00246" "CGND-HRA-00247" "CGND-HRA-00248" "CGND-HRA-00308"
+# # vs CGND-HRA-00243, CGND-HRA-00244, CGND-HRA-00245, CGND-HRA-00246, CGND-HRA-00248, CGND-HRA-00308, CGND-HRA-00903, CGND-HRA-01004, CGND-HRA-01032
+```
+```{r}
+# #plot PC1 against PC2 
+# 
+# #create column that identifies which points are outliers vs normal according to 3*SD boundaries.
+# pca_df_frontal_cortex <- pca_df_frontal_cortex%>%
+#   mutate(outlier1 = ifelse(sample_id %in% outliers_fc1$sample_id, "Outlier", "Normal"))
+# 
+# pca_df_frontal_cortex$outlier1
+# 
+# #plot PC1 against PC2 
+# ggplot(pca_df_frontal_cortex, aes(x = PC1, y = PC2, color = pca_df_frontal_cortex$outlier1)) +
+#   geom_point() +
+#   scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+#   labs(title = "Frontal Cortex PCA Plot (PC1 vs PC2)", x = "PC1", y = "PC2") +
+#   theme_classic() +
+#   theme(legend.position = "none")
+
+```
+
+```{r}
+# # other ways to find outliers for cerebellum
+# # Calculate the center (mean) of the PCA scores
+# center_cb <- colMeans(pca_df_cerebellum[, 2:3])  # For PC1 and PC2
+# 
+# # Calculate Euclidean distances from the center for each sample
+# distances_cb <- sqrt(rowSums((pca_df_cerebellum[, 2:3] - center_cb)^2))
+# 
+# # Add the distances to the data frame
+# pca_df_cerebellum$distance <- distances_cb
+# 
+# # Plot the distances
+# ggplot(pca_df_cerebellum, aes(x = distance)) +
+#   geom_histogram(binwidth = 0.5, fill = "skyblue", color = "black") +
+#   labs(title = "Histogram of Distance from Center", x = "Distance from Center", y = "Frequency") +
+#   theme_classic()
+```
+
+```{r}
+# # define threshold (2 or 3 standard deviations from the mean?)
+# threshold_cb <- mean(distances_cb) + 3 * sd(distances_cb)
+# 
+# # Identify outliers
+# outliers_cb1 <- pca_df_cerebellum[distances_cb > threshold_cb, ]
+# outliers_cb1
+# 
+# #"CGND-HRA-01510-2" "CGND-HRA-01544"   "CGND-HRA-01573"   "CGND-HRA-02244"   "CGND-HRA-00142"
+# # vs CGND-HRA-00121, CGND-HRA-00319, CGND-HRA-00846
+```
+
+
+```{r}
+# #create column that identifies which points are outliers vs normal according to 3*SD boundaries.
+# pca_df_cerebellum <- pca_df_cerebellum %>%
+#   mutate(outlier1 = ifelse(sample_id %in% outliers_cb1$sample_id, "Outlier", "Normal"))
+# 
+# pca_df_cerebellum$outlier1
+# 
+# #plot PC1 against PC2 
+# ggplot(pca_df_cerebellum, aes(x = PC1, y = PC2, color = pca_df_cerebellum$outlier1)) +
+#   geom_point() +
+#   scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+#   labs(title = "Cerebellum PCA Plot (PC1 vs PC2)", x = "PC1", y = "PC2") +
+#   theme_classic() +
+#   theme(legend.position = "none")
+
+```
+
+
+```{r}
+# # fc: outliers based on z-score
+# pca_df_frontal_cortex$z_PC1 <- (pca_df_frontal_cortex$PC1 - mean(pca_df_frontal_cortex$PC1)) / sd(pca_df_frontal_cortex$PC1)
+# pca_df_frontal_cortex$z_PC2 <- (pca_df_frontal_cortex$PC2 - mean(pca_df_frontal_cortex$PC2)) / sd(pca_df_frontal_cortex$PC2)
+# 
+# #fc: define outliers based on z-score
+# outliers_PC1_fc <- pca_df_frontal_cortex[abs(pca_df_frontal_cortex$z_PC1) > 3, ]
+# outliers_PC2_fc <- pca_df_frontal_cortex[abs(pca_df_frontal_cortex$z_PC2) > 3, ]
+# 
+# # Combine both sets of outliers (to find samples that are outliers in either PC1 or PC2)
+# outliers_fc2 <- unique(rbind(outliers_PC1_fc, outliers_PC2_fc))
+# 
+# # Print the outliers
+# outliers_fc2
+# 
+# #"CGND-HRA-00243" "CGND-HRA-00244" "CGND-HRA-00245" "CGND-HRA-00246" "CGND-HRA-00247""CGND-HRA-00248" "CGND-HRA-00308" 
+# # vs CGND-HRA-00243, CGND-HRA-00244, CGND-HRA-00245, CGND-HRA-00246, CGND-HRA-00247, CGND-HRA-00248, CGND-HRA-00308
+# # ^SAME
+
+```
+
+```{r}
+# # cb: outliers based on z-score
+# pca_df_cerebellum$z_PC1 <- (pca_df_cerebellum$PC1 - mean(pca_df_cerebellum$PC1)) /
+#   sd(pca_df_cerebellum$PC1)
+# pca_df_cerebellum$z_PC2 <- (pca_df_cerebellum$PC2 - mean(pca_df_cerebellum$PC2)) /
+#   sd(pca_df_cerebellum$PC2)
+# 
+# #cb: define outliers based on z-score
+# outliers_PC1_cb <- pca_df_cerebellum[abs(pca_df_cerebellum$z_PC1) > 3, ]
+# outliers_PC2_cb <- pca_df_cerebellum[abs(pca_df_cerebellum$z_PC2) > 3, ]
+# 
+# # Combine both sets of outliers (to find samples that are outliers in either PC1 or PC2)
+# outliers_cb2 <- unique(rbind(outliers_PC1_cb, outliers_PC2_cb))
+# 
+# # Print the outliers
+# outliers_cb2
+# 
+# #"CGND-HRA-01510-2" "CGND-HRA-01544"   "CGND-HRA-01573"   "CGND-HRA-02244"   "CGND-HRA-00142"  
+# # vs. CGND-HRA-01510-2, CGND-HRA-01544, CGND-HRA-01573, CGND-HRA-02244, CGND-HRA-00142
+# # ^SAME
+```
+
+
+```{r}
+# #create column that identifies which points are outliers vs normal according to 3*SD boundaries.
+# pca_df_cerebellum <- pca_df_cerebellum%>%
+#   mutate(outlier2 = ifelse(sample_id %in% outliers_cb2$sample_id, "Outlier", "Normal"))
+# 
+# pca_df_cerebellum$outlier2
+# 
+# #plot PC1 against PC2 
+# ggplot(pca_df_cerebellum, aes(x = PC1, y = PC2, color = pca_df_cerebellum$outlier2)) +
+#   geom_point() +
+#   scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+#   labs(title = "Cerebellum PCA Plot (PC1 vs PC2)", x = "PC1", y = "PC2") +
+#   theme_classic() +
+#   theme(legend.position = "none")
+
+```
+
+
+
+```{r}
+#selecting all columns and all rows except for 1st column (which contains sample ID), changing vector to df, and filtering out values that are NA or = 0
+picard_cols <- colSums(picard_tools[, -1]) %>%
+  enframe() %>%
+  filter(!is.na(value) & value > 0)     
+
+picard_tools <- picard_tools[, c("Sample", picard_cols$name) ]
+
+```
+
+```{r}
+# #get rid of non-numerical values in post_mortem_interval_in_hours, rin, and age_at_death
+# ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+#   mutate(post_mortem_interval_in_hours = case_when(
+#   post_mortem_interval_in_hours %in% c("Not Applicable", "Unknown") ~ NA_real_,
+#   TRUE ~ as.numeric(post_mortem_interval_in_hours)               
+#   ))
+# 
+# ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+#   mutate(age_at_death = case_when(
+#   age_at_death == "90 or older" ~ 90,
+#   age_at_death %in% c("Not Applicable", "Unknown") ~ NA_real_,
+#   TRUE ~ as.numeric(age_at_death)               
+#   )) %>%
+#   filter(!is.na(age_at_death)) 
+# 
+# ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+#   mutate(rin = case_when(
+#   rin %in% c("NA") ~ NA_real_,
+#   TRUE ~ as.numeric(rin)               
+#   )) %>%
+#   filter(!is.na(rin)) 
+
+#encode categorical columns (prep, sex) into numerical columns
+ALS_filtered_combined_cortex$prep <- as.numeric(as.factor(ALS_filtered_combined_cortex$prep))
+ALS_filtered_combined_cortex$sex <- as.numeric(as.factor(ALS_filtered_combined_cortex$sex))
+
+#metadata with only frontal cortex samples and relevant clinical columns
+metadata_fc <- ALS_filtered_combined_cortex %>% 
+  filter(sample_source == "Cortex_Frontal") %>%
+  select(external_sample_id, rin, age_at_death, post_mortem_interval_in_hours, prep, sex, site_specimen_collected, disease_short)
+
+#metadata with only cerebellum samples and relevant clinical columns
+metadata_cerebellum <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum") %>%
+  select(external_sample_id, rin, age_at_death, post_mortem_interval_in_hours, prep, sex, site_specimen_collected, disease_short)
+
+clinical_technical_var_fc <- metadata_fc %>%
+  inner_join(picard_tools, by = c("external_sample_id" = "Sample"))
+
+clinical_technical_var_cerebellum <- metadata_cerebellum %>%
+  inner_join(picard_tools, by = c("external_sample_id" = "Sample"))
+```
+
+
+```{r}
+#correlation matrix for the clinical and technical variables for frontal cortex
+fc_cor_matrix<-
+clinical_technical_var_fc %>%
+  #select(-external_sample_id, CORRECT_STRAND_READS, INCORRECT_STRAND_READS, PCT_CORRECT_STRAND_READS) %>%   #remove conflicting column
+  select(where(is.numeric)) %>%
+  cor(use = "complete.obs", method = "spearman") #complete.obs handles NA values
+
+#Remove NA values (removing columns and rows'IGNORED_READS', 'CORRECT_STRAND_READS', 'INCORRECT_STRAND_READS', 'PCT_CORRECT_STRAND_READS')
+#fc_cor_matrix <- fc_cor_matrix[, c(-13, -14, -15, -28)]
+#fc_cor_matrix <- fc_cor_matrix[-c(13, 14, 15, 28), ]
+
+library(pheatmap)
+
+# Visualize with pheatmap
+pheatmap(abs(fc_cor_matrix), 
+         color = colorRampPalette(c("blue", "white", "red"))(200),
+         na_col = "grey",  # Set color for NA cells
+         show_colnames = FALSE,
+         main = "Clinical and Technical Variables Correlation Map for Frontal Cortex")
+
+```
+
+
+```{r}
+#correlation matrix for the clinical and technical variables for cerebellum
+cb_cor_matrix<-
+clinical_technical_var_cerebellum %>%
+  #select(-external_sample_id, CORRECT_STRAND_READS, INCORRECT_STRAND_READS, PCT_CORRECT_STRAND_READS) %>%   #remove conflicting column
+  select(where(is.numeric)) %>%
+  cor(use = "complete.obs", method = "spearman") #complete.obs handles NA values
+
+#Remove NA values (removing columns and rows'IGNORED_READS', 'CORRECT_STRAND_READS', 'INCORRECT_STRAND_READS', 'PCT_CORRECT_STRAND_READS')
+#cb_cor_matrix <- cb_cor_matrix[, c(-13, -14, -15, -28)]
+#cb_cor_matrix <- cb_cor_matrix[-c(13, 14, 15, 28), ]
+
+library(pheatmap)
+
+# Visualize with pheatmap
+pheatmap(abs(cb_cor_matrix), 
+         color = colorRampPalette(c("blue", "white", "red"))(200),
+         na_col = "grey",  # Set color for NA cells
+         show_colnames = FALSE,
+         main = "Clinical and Technical Variables Correlation Map for Cerebellum")
+
+```
+
+```{r}
+#creating correlation matrix between covariates and PC (top 15) for frontal cortex
+combined_pc_covar_cf <- inner_join(pca_df_frontal_cortex[,1:16], clinical_technical_var_fc, by = c("sample_id" = "external_sample_id"))
+
+#combined_pc_covar_cf <- merge(
+#  pca_df_frontal_cortex,
+#  clinical_technical_var_fc,
+#  by.x = "sample_id",
+#  by.y = "external_sample_id"
+#)
+
+#create subset of pca results to get top 15 pcs
+top_pcs <- combined_pc_covar_cf[, 2:16]   #exclude first column (which is sample_id)
+covariates <- combined_pc_covar_cf[,17:ncol(combined_pc_covar_cf)]
+
+#initialize the matrices:
+#matrix_rsquared used to store adjusted R^2 values from linear regressions
+matrix_rsquared = matrix(NA, nrow = ncol(covariates), ncol = ncol(top_pcs))
+#matrix pvalue used to store p values from regressions
+matrix_pvalue = matrix(NA, nrow = ncol(covariates), ncol = ncol(top_pcs))
+#dimensions of matrices: rows are number of covariates (from technical and clinical variables for fc) and the columns are top 15 PCs
+
+#print(dim(top_pcs))
+#print(dim(fc_cor_matrix))
+#length(fc_cor_matrix[i])
+
+#colSums(as.numeric(covariates))
+
+#for each combination of covariate (fc_cor_matrix[x]) and a principle component (y), calculate R^2 value from linear model:
+# Loop through each covariate and principal component
+for (i in 1:ncol(covariates)) {
+  for (j in 1:ncol(top_pcs)) {
+    #print(i)
+    #print(j)
+    # Perform linear regression
+    lm_result <- lm(top_pcs[, j] ~ covariates[, i])
+    # Extract adjusted R²
+    matrix_rsquared[i, j] <- summary(lm_result)$adj.r.squared
+    # Extract p-value
+    matrix_pvalue[i, j] <- summary(lm_result)$coefficients[2, 4] # P-value for the covariate
+  }
+}
+
+rownames(matrix_rsquared) <- colnames(covariates)
+colnames(matrix_rsquared) <- paste0("PC", 1:15)
+rownames(matrix_pvalue) <- colnames(covariates)
+colnames(matrix_pvalue) <- colnames(top_pcs)
+
+#heatmap for r squared 
+pheatmap(
+  matrix_rsquared,
+  cluster_rows = TRUE,  # Hierarchical clustering of rows
+  cluster_cols = FALSE,  # Hierarchical clustering of columns
+  color = colorRampPalette(c("white", "blue"))(50), # Gradient from white to blue
+  main = "R^2 Heatmap for Frontal",
+  fontsize_row = 10,    # Adjust row font size
+  fontsize_col = 10     # Adjust column font size
+)
+
+```
+
+```{r}
+pheatmap(
+  -log10(matrix_pvalue),
+  cluster_rows = TRUE,  # Hierarchical clustering of rows
+  cluster_cols = FALSE,  # Hierarchical clustering of columns
+  color = colorRampPalette(c("white", "blue"))(50), # Gradient from white to blue
+  main = "P-value Heatmap for Frontal Cortex",
+  fontsize_row = 10,    # Adjust row font size
+  fontsize_col = 10     # Adjust column font size
+)
+```
+
+
+```{r}
+#creating correlation matrix between covariates and PC (top 15) for cerebellum
+combined_pc_covar_cb <- inner_join(pca_df_cerebellum[,1:16], clinical_technical_var_cerebellum, by = c("sample_id" = "external_sample_id"))
+
+#combined_pc_covar_cb <- merge(
+#  pca_df_frontal_cortex,
+#  clinical_technical_var_fc,
+#  by.x = "sample_id",
+#  by.y = "external_sample_id"
+#)
+
+#create subset of pca results to get top 15 pcs
+top_pcs_cb <- combined_pc_covar_cb[, 2:16] #exclude first column (which is sample_id)
+covariates_cb <- combined_pc_covar_cb[,17:ncol(combined_pc_covar_cb)]
+
+#initialize the matrices:
+#matrix_rsquared used to store adjusted R^2 values from linear regressions
+matrix_rsquared_cb = matrix(NA, nrow = ncol(covariates_cb), ncol = ncol(top_pcs_cb))
+#matrix pvalue used to store p values from regressions
+matrix_pvalue_cb = matrix(NA, nrow = ncol(covariates_cb), ncol = ncol(top_pcs_cb))
+#dimensions of matrices: rows are number of covariates (from technical and clinical variables for fc) and the columns are top 15 PCs
+
+#for each combination of covariate (fc_cor_matrix[x]) and a principle component (y), calculate R^2 value from linear model:
+# Loop through each covariate and principal component
+for (i in 1:ncol(covariates_cb)) {
+  for (j in 1:ncol(top_pcs_cb)) {
+    # Perform linear regression
+    lm_result <- lm(top_pcs_cb[, j] ~ covariates_cb[, i])
+    # Extract adjusted R^2
+    matrix_rsquared_cb[i, j] <- summary(lm_result)$adj.r.squared
+    # Extract p-value
+    matrix_pvalue_cb[i, j] <- summary(lm_result)$coefficients[2, 4] # P-value for the covariate
+  }
+}
+
+rownames(matrix_rsquared_cb) <- colnames(covariates_cb)
+colnames(matrix_rsquared_cb) <- paste0("PC", 1:15)
+rownames(matrix_pvalue_cb) <- colnames(covariates_cb)
+colnames(matrix_pvalue_cb) <- colnames(top_pcs_cb)
+
+#heatmap for r squared 
+pheatmap(
+  matrix_rsquared_cb,
+  cluster_rows = TRUE,  # Hierarchical clustering of rows
+  cluster_cols = FALSE,   # Hierarchical clustering of columns
+  color = colorRampPalette(c("white", "blue"))(50), # Gradient from white to blue
+  main = "R^2 Heatmap for Cerebellum",
+  fontsize_row = 10,    # Adjust row font size
+  fontsize_col = 10     # Adjust column font size
+)
+
+```
+
+
+```{r}
+pheatmap(
+  matrix_pvalue_cb,
+  cluster_rows = TRUE,  # Hierarchical clustering of rows
+  cluster_cols = FALSE,  # Hierarchical clustering of columns
+  color = colorRampPalette(c("white", "blue"))(50), # Gradient from white to blue
+  main = "P-value Heatmap for Cerebellum",
+  fontsize_row = 10,    # Adjust row font size
+  fontsize_col = 10     # Adjust column font size
+)
+```
+
+```{r}
+#Variance partitioning plots for fc
+
+#combine metadatas of fc and cb
+#metadata_all <- bind_rows(clinical_technical_var_cerebellum, clinical_technical_var_fc)
+
+#filter out lowly transcribed genes
+#zero_variance_genes <- apply(selected_samples_gene_tpm, 1, function(x) var(x) == 0) 
+
+#remove lowly transcribed genes (mean tpm >1) -> 10-20k
+#filtered_genes_tpm <- log_genes_tpm[!zero_variance_genes & !low_expressed_genes, ] 
+genes_fc <- filtered_genes_tpm[, names(filtered_genes_tpm) %in% clinical_technical_var_fc$external_sample_id]
+
+
+#order columns in gene expression df and order samples in metadata fc
+genes_fc[, order(colnames(genes_fc))]
+clinical_technical_var_fc <- clinical_technical_var_fc[order(clinical_technical_var_fc$external_sample_id),]
+
+#putting first column (external_sample_id) as rownames
+metadata_fc1 <- clinical_technical_var_fc %>%
+  column_to_rownames(var = "external_sample_id")
+
+#metadata_all <- metadata_all[names(genes_fc_cb), ]
+metadata_fc1 <- metadata_fc1[names(genes_fc),]
+
+#change variables to factor to make them into categorical variables
+metadata_fc1$sex <- as.factor(metadata_fc1$sex)
+metadata_fc1$prep <- as.factor(metadata_fc1$prep)
+metadata_fc1$age_at_death <- scale(as.numeric(metadata_fc1$age_at_death), center= TRUE)
+metadata_fc1$rin <- scale(as.numeric(metadata_fc1$rin), center = TRUE)
+metadata_fc1$post_mortem_interval_in_hours <- scale(as.numeric(metadata_fc1$post_mortem_interval_in_hours), center = TRUE)
+metadata_fc1$disease_short <- as.factor(metadata_fc1$disease_short)
+metadata_fc1$site_specimen_collected <- as.factor(metadata_fc1$site_specimen_collected)
+#metadata_all$PCT_MRNA_BASES <- as.factor(metadata_all$PCT_MRNA_BASES)
+
+#can't find the equation that would work with PCT_MRNA_BASES!: number of levels of each grouping factor must be < number of observations (problems: PCT_MRNA_BASES)
+
+form_fc <- ~age_at_death + (1|sex) + (1|prep) + PCT_RIBOSOMAL_BASES + MEDIAN_5PRIME_TO_3PRIME_BIAS + PCT_R1_TRANSCRIPT_STRAND_READS + post_mortem_interval_in_hours + rin + PCT_MRNA_BASES + (1|disease_short) + (1|site_specimen_collected)
+#form_fc <- ~ (1|age_at_death) + (1|sex) + PCT_RIBOSOMAL_BASES + MEDIAN_5PRIME_TO_3PRIME_BIAS + (1|prep) + post_mortem_interval_in_hours + PCT_R1_TRANSCRIPT_STRAND_READS + rin + PCT_MRNA_BASES
+
+#experimental gene set
+#fcgene_exp <- genes_fc[1:10,]
+
+#varPart_fc <- fitExtractVarPartModel(genes_fc, form_fc, metadata_fc1)
+#vp_fc <- sortCols(varPart_fc)
+#plotVarPart(vp_fc)
+
+
+```
+
+
+```{r}
+#variance partitioning for cerebellum 
+
+genes_cb <- filtered_genes_tpm[, names(filtered_genes_tpm) %in% clinical_technical_var_cerebellum$external_sample_id]
+
+#order columns in gene expression df (cerebellum) and order samples in metadata for cb
+genes_cb[, order(colnames(genes_cb))]
+clinical_technical_var_cerebellum <- clinical_technical_var_cerebellum[order(clinical_technical_var_cerebellum$external_sample_id),]
+
+#create rownames from first column 
+metadata_cb1 <- clinical_technical_var_cerebellum %>%
+  column_to_rownames(var = "external_sample_id")
+
+metadata_cb1 <- metadata_cb1[names(genes_cb),]
+
+#change variables to factor to make them into categorical variables
+metadata_cb1$sex <- as.factor(metadata_cb1$sex)
+metadata_cb1$prep <- as.factor(metadata_cb1$prep)
+metadata_cb1$age_at_death <- scale(as.numeric(metadata_cb1$age_at_death), center = TRUE)
+metadata_cb1$rin <- scale(as.numeric(metadata_cb1$rin), center = TRUE)
+metadata_cb1$post_mortem_interval_in_hours <- scale(as.numeric(metadata_cb1$post_mortem_interval_in_hours), center = TRUE)
+metadata_cb1$disease_short <- as.factor(metadata_cb1$disease_short)
+metadata_cb1$site_specimen_collected <- as.factor(metadata_cb1$site_specimen_collected)
+#metadata_cb1$INTERGENIC_BASES <- scale(metadata_cb1$INTERGENIC_BASES, center = TRUE)
+
+#intergenic bases, median_3 prime_bias, sites
+form_cb <- ~ (1|sex) + (1|prep) + age_at_death + post_mortem_interval_in_hours + rin + (1|disease_short) + (1|site_specimen_collected) + PCT_INTERGENIC_BASES + MEDIAN_3PRIME_BIAS + PCT_MRNA_BASES 
+
+#experimental gene set
+#cbgene_exp <- genes_cb[1:10,]
+
+#varPart_cb <- fitExtractVarPartModel(genes_cb, form_cb, metadata_cb1)
+#vp_cb <- sortCols(varPart_cb)
+#plotVarPart(vp_cb)
+```
+
+```{r}
+#Plotting distribution of picard variables based on variance plots:
+#for fc: PCT_RIBOSOMAL_BASES, MEDIAN_5PRIME_TO_3PRIME_BIAS, PCT_R1_TRANSCRIPT_STRAND_READS, PCT_MRNA_BASES
+clinical_technical_var_fc %>%
+ggplot(aes(x = disease_short, y = PCT_RIBOSOMAL_BASES)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: PCT_RIBOSOMAL_BASES Across Disease Groups",
+       x = "Disease Group",
+       y = "PCT_RIBOSOMAL_BASES") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+clinical_technical_var_fc %>%
+ggplot(aes(x = disease_short, y = MEDIAN_5PRIME_TO_3PRIME_BIAS)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: MEDIAN_5PRIME_TO_3PRIME_BIAS Across Disease Groups",
+       x = "Disease Group",
+       y = "MEDIAN_5PRIME_TO_3PRIME_BIAS") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+
+```
+
+
+```{r}
+clinical_technical_var_fc %>%
+ggplot(aes(x = disease_short, y = PCT_R1_TRANSCRIPT_STRAND_READS)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: PCT_R1_TRANSCRIPT_STRAND_READS Across Disease Groups",
+       x = "Disease Group",
+       y = "PCT_R1_TRANSCRIPT_STRAND_READS") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+clinical_technical_var_fc %>%
+ggplot(aes(x = disease_short, y = PCT_MRNA_BASES)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: PCT_MRNA_BASES Across Disease Groups",
+       x = "Disease Group",
+       y = "PCT_MRNA_BASES") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+#Plotting distribution of picard variables based on variance plots:
+#for cb: PCT_INTERGENIC_BASES + MEDIAN_3PRIME_BIAS + PCT_MRNA_BASES 
+clinical_technical_var_cerebellum %>%
+ggplot(aes(x = disease_short, y = PCT_INTERGENIC_BASES)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: PCT_INTERGENIC_BASES Across Disease Groups",
+       x = "Disease Group",
+       y = "PCT_INTERGENIC_BASES") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+clinical_technical_var_cerebellum %>%
+ggplot(aes(x = disease_short, y = MEDIAN_3PRIME_BIAS)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: MEDIAN_3PRIME_BIAS Across Disease Groups",
+       x = "Disease Group",
+       y = "MEDIAN_3PRIME_BIAS") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+clinical_technical_var_cerebellum %>%
+ggplot(aes(x = disease_short, y = PCT_MRNA_BASES)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: PCT_MRNA_BASES Across Disease Groups",
+       x = "Disease Group",
+       y = "PCT_MRNA_BASES") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+```{r}
+#saving data for later workbooks 
+ALS_combined_cb_fc <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal")
+save(ALS_combined_cb_fc, file = "ALS_combined_cb_fc.RData")
+save(clinical_technical_var_cerebellum, file= "clinical_technical_var_cerebellum.RData")
+save(clinical_technical_var_fc, file = "clinical_technical_var_fc.Rdata")
+
+```
+

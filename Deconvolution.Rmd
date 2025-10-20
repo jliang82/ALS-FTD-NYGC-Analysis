@@ -1,0 +1,864 @@
+---
+title: "Deconvolution"
+author: "Judy Liang"
+date: "2025-07-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dtangle)
+library(limma)
+library(tidyverse)
+library(tibble)
+library(tidyr)
+library(dplyr)
+
+
+#load in marker gene file
+load("Human_cere_tissue.RData")
+#load original samples dataset
+load("ALS_filtered_combined_cortex.RData")
+#load in tpm gene file
+load("~/Downloads/april_5_gene_matrix.RData")
+#load in cb samples and fc samples list (containing sample id, disease, and sample source)
+load("fc_cb_samples.RData")
+load("cb_samples.RData")
+
+```
+
+
+```{r}
+#Requirements:
+#1. single cell RNA dataset (raw matrix form: rownames are genes, columns are sample ids)
+#2. cell metadata table (needs to contain info about sample IDs, matched to its cell type and its subject ID)
+#3. Bulk RNA dataset: gene expression matrix of genes by samples (tpm)
+
+#take a list of marker genes, 
+load()
+
+#gene names (rownames) of single cell RNA and bulk RNA dataset have to be consistent
+
+#create dataset containing marker genes intersected with our set of cb and fc genes
+
+#dtangle -> to estimate cell type proportions
+
+
+
+#remove lowly expressed genes
+```
+
+```{r}
+#load bulk RNA dataset
+
+#untar("/Users/judyliang/Downloads/GSE67835_RAW.tar", exdir = "/Users/judyliang/Downloads/GSE67835_RAW")
+#darmanis_bulk <- read_csv("/Users/judyliang/Downloads/GSE67835_RAW/")
+# Read all files into a list of data frames
+expression_list <- lapply("/Users/judyliang/Downloads/GSE67835_RAW/", function(f) {
+  df <- read.csv(gzfile(f), row.names = 1)  # assuming gene names in rownames
+  colnames(df) <- tools::file_path_sans_ext(basename(f))  # name by filename
+  return(df)
+})
+
+```
+
+```{r}
+read_bulk_rna_folder <- function(folder_path) {
+  files <- list.files(folder_path, pattern = "\\.csv\\.gz$", full.names = TRUE)
+  
+  sample_dfs <- list()
+  
+  for (file_path in files) {
+    # Read as tab-delimited file
+    df <- tryCatch({
+      read.table(gzfile(file_path), sep = "\t", header = FALSE, stringsAsFactors = FALSE)
+    }, error = function(e) {
+      message("Failed to read: ", file_path)
+      return(NULL)
+    })
+    
+    # Skip if empty or not 2 columns
+    if (is.null(df) || ncol(df) < 2) {
+      message("Skipping file (too few columns): ", file_path)
+      next
+    }
+    
+    colnames(df) <- c("gene_id", "count")
+    
+    # Extract sample name like "C03"
+    sample_name <- sub(".*\\.(C\\d+)\\.csv\\.gz$", "\\1", basename(file_path))
+    
+    colnames(df)[2] <- sample_name
+    sample_dfs[[sample_name]] <- df
+  }
+  
+  # Merge all by gene_id
+  merged_df <- Reduce(function(x, y) merge(x, y, by = "gene_id", all = TRUE), sample_dfs)
+  
+  # Set gene_id as rownames and remove that column
+  rownames(merged_df) <- merged_df$gene_id
+  merged_df$gene_id <- NULL
+  
+  # Replace NAs with 0
+  merged_df[is.na(merged_df)] <- 0
+  
+  return(merged_df)
+}
+
+expr_matrix <- read_bulk_rna_folder("/Users/judyliang/Downloads/GSE67835_RAW/")
+head(expr_matrix)
+```
+
+
+```{r}
+library(dplyr)
+
+dge <- DGEList(counts = cbCounts)
+# Normalize
+dge <- calcNormFactors(dge, method = "TMM")
+# log-transformed expression matrix
+expr_matrix <- cpm(dge, log = TRUE)
+#difference between doing log here vs later on? And quantile and 
+
+marker_df <- cere_gsea_disjoint 
+
+marker_df <- marker_df[marker_df$gene %in% rownames(expr_matrix), ]
+
+#convert marker df to list
+marker_list <- split(marker_df$gene, marker_df$term_id)
+```
+
+
+```{r}
+BiocManager::install("dtangle")
+library(dtangle)
+
+#pure_samples = as.list(1:5)
+#names(pure_samples) = colnames(expr_matrix)[1:5]
+
+#pure_samples has to be same length as number of columns in expr matrix 
+#and has to contain name of cell types or NA
+
+#List of one-dimensional integer. Must implement as.list.
+#The i-th element of the top-level list is a vector of indicies (rows of Y or references)
+#that are pure samples of type i. If references is not specified then this argument identifies which rows of Y correspond to #pure reference samples of which
+#cell-types. If references is specified then this makes same idenficiation but for
+#the references matrix instead.
+
+pure_samples <- rep(NA, ncol(expr_matrix))  
+names(pure_samples) <- colnames(expr_matrix)[1:5]
+
+dtangle_results <- dtangle(Y = expr_matrix, markers = marker_list, pure_samples = pure_samples)
+
+```
+
+#starting here, using Jack's code
+
+
+```{r}
+load("/Users/judyliang/Downloads/GSE67835.RData")
+#metadata_darmanis <- read_csv("/Users/judyliang/Downloads/SraRunTable.csv")
+
+# extract fields from metadata
+darmanis_metadata <- 
+  readr::read_csv("/Users/judyliang/Downloads/SraRunTable.csv") %>% 
+  janitor::clean_names() %>%
+  dplyr::select(cellID = sample_name, cellType = cell_type, sampleID = experiment_sample_name )
+#keeping rows in metadata matching columns of Darmanis
+darmanis_metadata <- filter(darmanis_metadata, cellID %in% colnames(Darmanis))
+
+DarmanisCells <- darmanis_metadata$cellType
+names(DarmanisCells) <- darmanis_metadata$cellID
+```
+
+```{r}
+compareReferenceCells <- function(bulk_expression, reference_expression, reference_meta){
+  # only use reference genes present in bulk
+  int <- intersect(rownames(bulk_expression),rownames(reference_expression))
+  y <- DGEList(counts= reference_expression[int,])
+  y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(reference_expression[,1]/sum(reference_expression[,1])),0.75))
+  
+  reference_expression <- cpm(y, log=FALSE)
+  reference_expressionMean = sapply(unique(reference_meta),function(x)rowMeans(reference_expression[,names(which(reference_meta==x))]))
+  int = intersect(rownames(bulk_expression),rownames(reference_expressionMean))
+  design = model.matrix(~.-1,data.frame(cell= reference_meta[colnames(reference_expression)]))
+  colnames(design) = gsub('cell','',colnames(design))
+  v <- voom(reference_expression[int,rownames(design)], design, plot=FALSE)
+  fit <- lmFit(v, design)
+  x = sapply(colnames(design),function(x)paste(x,'-(',paste(colnames(design)[colnames(design)!=x],collapse = "+"),')/4',sep = ''))
+  con = makeContrasts(contrasts = x,levels = colnames(design))
+  fit = contrasts.fit(fit,con)
+  fit <- eBayes(fit, robust=TRUE)
+  
+  return(list(design = design, fit = fit))
+}
+
+createMarkers <- function( input, n_markers = 10){
+  markers = NULL
+  
+  for(i in 1:ncol(input$design)){
+    x = input$fit$coef[p.adjust(input$fit$p.v[,i],'fdr')<0.05,i]
+    markers[[colnames(input$design)[i]]] =  names(head(sort(-x[x>0]),n_markers))
+  }
+  unlist(lapply(markers,length))
+  
+  full_genes = NULL
+  for(i in 1:ncol(input$design)){
+    x = input$fit$coef[p.adjust(input$fit$p.v[,i],'fdr')<0.05,i]
+   full_genes[[colnames(input$design)[i]]] =  names(sort(-x[x>0]))
+  }
+  unlist(lapply(full_genes,length))
+  
+  return( list(markers = markers, full = full_genes) )
+}
+
+gene_dedup <- filter(gene_names, !duplicated(gene_name))
+geneExpr_cb <- cbCounts
+rownames(geneExpr_cb) <- gene_dedup$gene_name[match(rownames(geneExpr_cb), gene_dedup$gene_id)]
+
+
+#createMarkers 
+darmanis_fit <- compareReferenceCells(bulk_expression = geneExpr_cb, reference_expression = Darmanis, reference_meta = DarmanisCells)
+
+darmanis_markers <- createMarkers(darmanis_fit, n_markers = 100)
+```
+
+```{r}
+d_mean <- split(darmanis_metadata, darmanis_metadata$cellType) %>%
+  map("cellID") %>%
+  map_dfc( ~{
+    rowMeans(cpm(Darmanis[,.x]))
+  }) %>% as.data.frame()
+row.names(d_mean) <- row.names(Darmanis)
+
+sce <- d_mean #DarmanisMean #d_mean 
+ge <- geneExpr_cb
+commongenes <- intersect (rownames(ge), rownames(sce))
+ge <- ge[pmatch(commongenes, rownames(ge)), ]
+sce <- sce[pmatch(commongenes, rownames(sce)), ]
+y <- cbind(sce, ge)
+y <- DGEList(counts= y)
+y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(Darmanis[,1]/sum(Darmanis[,1])),0.75))
+y <- cpm(y, log=FALSE)
+y <- normalizeQuantiles(y)
+pure_samples = as.list(1:5)
+names(pure_samples) = colnames(y)[1:5]
+markers = lapply(darmanis_markers$markers,intersect,rownames(y))
+dtDarmanis_cb <- dtangle(log2(t(y)), pure_samples=pure_samples, markers = markers[names(pure_samples)])$estimates
+
+```
+
+run on frontal cortex
+prop of cell types relation with disease type, PCs
+
+sample names are rownames -> we want it in column names (rownames_to_columns()) -> use to match to clinical metadata and PCs
+
+```{r}
+library(tibble)
+dt_cb_df <- dtDarmanis_cb %>% 
+  as.data.frame() 
+
+#remove the reference rows
+dt_cb_df <- dt_cb_df[!rownames(dt_cb_df) %in% c("astrocytes", "endothelial", "microglia", "neurons", "oligodendrocytes"), ]
+#transform df so sample ids are columns
+dt_cb_bulk <- dt_cb_df %>%
+  tibble::rownames_to_column(var = "external_sample_id")  
+
+```
+
+```{r}
+#combine with cb samples metadata
+dt_cb_combined_clinicalmd <- left_join(cb_samples, dt_cb_bulk, by = "external_sample_id")
+
+dt_cb_combined_long <- dt_cb_combined_clinicalmd  %>%
+  pivot_longer(cols = astrocytes:oligodendrocytes,
+               names_to = "cell_type",
+               values_to = "proportion")
+
+ggplot(dt_cb_combined_long, aes(x = disease_short, y = proportion, fill = disease_short)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Cerebellum: Cell Type Proportions by Disease Type")
+```
+
+```{r}
+#cell type prop to rin
+ggplot(dt_cb_combined_long, aes(x = rin, y = proportion, color= cell_type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    x = "RIN",
+    y = "Cell Type Proportion",
+    title = "Relationship between RIN and Cell Type Proportion"
+  ) +
+  theme_classic()
+```
+
+```{r}
+#cell type prop to pmi
+ggplot(dt_cb_combined_long, aes(x = post_mortem_interval_in_hours, y = proportion, color= cell_type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    x = "Post Mortem Interval (hours)",
+    y = "Cell Type Proportion",
+    title = "Relationship between PMI and Cell Type Proportion"
+  ) +
+  theme_classic()
+```
+```{r}
+#cell type prop to pmi
+ggplot(dt_cb_combined_long, aes(x = post_mortem_interval_in_hours, y = proportion, color= cell_type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    x = "Post Mortem Interval (hours)",
+    y = "Cell Type Proportion",
+    title = "Relationship between PMI and Cell Type Proportion"
+  ) +
+  theme_classic()
+```
+
+```{r}
+#trying to see cell type prop among PCs
+# Extract PC scores per sample from pca_cb_sva
+sample_pcs_cb <- as.data.frame(pca_cb_sva$x)
+sample_pcs_cb <- sample_pcs_cb %>%
+  tibble::rownames_to_column(var = "external_sample_id")
+
+dt_cb_combined_pcs<- left_join(dt_cb_bulk, sample_pcs_cb, by = "external_sample_id")
+
+dt_cb_combined_pcs_long <- dt_cb_combined_pcs %>%
+  pivot_longer(cols = astrocytes:oligodendrocytes,
+               names_to = "cell_type",
+               values_to = "proportion")
+```
+
+
+```{r}
+dt_cb_pcs_plot <- dt_cb_combined_pcs_long %>% 
+  select(external_sample_id, cell_type, proportion, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+ggplot(dt_cb_pcs_plot, aes(x = value, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7, size = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(PC ~ cell_type, scales = "free") +
+  labs(title = "Cerebellum: Cell type proportions vs PCs", x = "PC value", y = "Proportion") +
+  theme_classic()
+
+```
+
+```{r}
+ggplot(dt_cb_combined_pcs_long, aes(x = PC1, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Cell type proportions vs PC1", y = "Proportion", x = "PC1") +
+  theme_classic()
+```
+
+```{r}
+ggplot(dt_cb_combined_pcs_long, aes(x = PC2, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Cell type proportions vs PC2", y = "Proportion", x = "PC2") +
+  theme_classic()
+```
+
+```{r}
+ggplot(dt_cb_combined_pcs_long, aes(x = PC3, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Cell type proportions vs PC3", y = "Proportion", x = "PC3") +
+  theme_classic()
+```
+
+```{r}
+ggplot(dt_cb_combined_pcs_long, aes(x = PC4, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Cell type proportions vs PC4", y = "Proportion", x = "PC4") +
+  theme_classic()
+```
+
+```{r}
+ggplot(dt_cb_combined_pcs_long, aes(x = PC5, y = proportion, color = cell_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Cell type proportions vs PC5", y = "Proportion", x = "PC5") +
+  theme_classic()
+```
+
+```{r}
+#create heatmap of PCs vs cell types and their correlations
+# select relevant columns
+cor_df <- dt_cb_combined_pcs %>% 
+  select(external_sample_id, astrocytes:oligodendrocytes, PC1:PC5)
+
+# Compute Spearman correlation matrix
+cor_matrix <- cor(cor_df[, c("astrocytes", "endothelial", "microglia", "neurons", "oligodendrocytes")],
+                           cor_df[, c("PC1", "PC2", "PC3", "PC4", "PC5")],
+                           method = "spearman",
+                           use = "pairwise.complete.obs")
+
+cor_long <- as.data.frame(cor_matrix) %>%
+  tibble::rownames_to_column("cell_type") %>%
+  pivot_longer(cols = -cell_type, names_to = "PC", values_to = "correlation")
+
+ggplot(cor_long, aes(x = PC, y = cell_type, fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1),
+                       name = "Spearman\nCorrelation") +
+  theme_classic() +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  labs(title = "Cerebellum (dtangle): PCs vs Cell Type Proportions",
+       x = "Principal Component",
+       y = "Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+#frontal cortex
+gene_dedup <- filter(gene_names, !duplicated(gene_name))
+geneExpr_fc <- fcCounts
+rownames(geneExpr_fc) <- gene_dedup$gene_name[match(rownames(geneExpr_fc), gene_dedup$gene_id)]
+
+#createMarkers 
+darmanis_fit <- compareReferenceCells(bulk_expression = geneExpr_fc, reference_expression = Darmanis, reference_meta = DarmanisCells)
+
+darmanis_markers <- createMarkers(darmanis_fit, n_markers = 100)
+```
+
+```{r}
+d_mean <- split(darmanis_metadata, darmanis_metadata$cellType) %>%
+  map("cellID") %>%
+  map_dfc( ~{
+    rowMeans(cpm(Darmanis[,.x]))
+  }) %>% as.data.frame()
+row.names(d_mean) <- row.names(Darmanis)
+
+sce <- d_mean #DarmanisMean #d_mean 
+ge <- geneExpr_fc
+commongenes <- intersect (rownames(ge), rownames(sce))
+ge <- ge[pmatch(commongenes, rownames(ge)), ]
+sce <- sce[pmatch(commongenes, rownames(sce)), ]
+y <- cbind(sce, ge)
+y <- DGEList(counts= y)
+y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(Darmanis[,1]/sum(Darmanis[,1])),0.75))
+y <- cpm(y, log=FALSE)
+y <- normalizeQuantiles(y)
+pure_samples = as.list(1:5)
+names(pure_samples) = colnames(y)[1:5]
+markers = lapply(darmanis_markers$markers,intersect,rownames(y))
+dtDarmanis_fc <- dtangle(log2(t(y)), pure_samples=pure_samples, markers = markers[names(pure_samples)])$estimates
+```
+
+
+```{r}
+library(tibble)
+dt_fc_df <- dtDarmanis_fc %>% 
+  as.data.frame() 
+
+#remove the reference rows
+dt_fc_df <- dt_fc_df[!rownames(dt_fc_df) %in% c("astrocytes", "endothelial", "microglia", "neurons", "oligodendrocytes"), ]
+#transform df so sample ids are columns
+dt_fc_bulk <- dt_fc_df %>%
+  tibble::rownames_to_column(var = "external_sample_id")  
+
+```
+
+```{r}
+#combine with fc samples metadata
+dt_fc_combined_clinicalmd <- left_join(fc_samples, dt_fc_bulk, by = "external_sample_id")
+
+dt_fc_combined_long <- dt_fc_combined_clinicalmd  %>%
+  pivot_longer(cols = astrocytes:oligodendrocytes,
+               names_to = "cell_type",
+               values_to = "proportion")
+
+ggplot(dt_fc_combined_long, aes(x = disease_short, y = proportion, fill = disease_short)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Frontal Cortex: Cell Type Proportions by Disease Type")
+```
+
+```{r}
+#trying to see cell type prop among PCs
+# Extract PC scores per sample from pca_sva
+sample_pcs_fc <- as.data.frame(pca_sva$x)
+sample_pcs_fc <- sample_pcs_fc %>%
+  tibble::rownames_to_column(var = "external_sample_id")
+
+dt_fc_combined_pcs<- left_join(dt_fc_bulk, sample_pcs_fc, by = "external_sample_id")
+
+dt_fc_combined_pcs_long <- dt_fc_combined_pcs %>%
+  pivot_longer(cols = astrocytes:oligodendrocytes,
+               names_to = "cell_type",
+               values_to = "proportion")
+```
+
+
+```{r}
+dt_fc_pcs_plot <- dt_fc_combined_pcs_long %>% 
+  select(external_sample_id, cell_type, proportion, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+ggplot(dt_fc_pcs_plot, aes(x = value, y = proportion)) +
+  geom_point(alpha = 0.7, size = 0.5, aes(color = cell_type)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(PC ~ cell_type, scales = "free") +
+  #facet_wrap(~ PC, scales = "free_x") +
+  labs(title = "FC: Cell type proportions vs PCs", x = "PC value", y = "Proportion") +
+  theme_classic() +
+  ggpubr::stat_cor(method = "spearman")
+
+```
+
+```{r}
+#create heatmap of PCs vs cell types and their correlations
+# select relevant columns
+fc_cor_df <- dt_fc_combined_pcs %>% 
+  select(external_sample_id, astrocytes:oligodendrocytes, PC1:PC5)
+
+# Compute Spearman correlation matrix
+fc_cor_matrix <- cor(fc_cor_df[, c("astrocytes", "endothelial", "microglia", "neurons", "oligodendrocytes")],
+                           fc_cor_df[, c("PC1", "PC2", "PC3", "PC4", "PC5")],
+                           method = "spearman",
+                           use = "pairwise.complete.obs")
+
+fc_cor_long <- as.data.frame(fc_cor_matrix) %>%
+  tibble::rownames_to_column("cell_type") %>%
+  pivot_longer(cols = -cell_type, names_to = "PC", values_to = "correlation")
+
+ggplot(fc_cor_long, aes(x = PC, y = cell_type, fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1),
+                       name = "Spearman\nCorrelation") +
+  theme_classic() +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  labs(title = "Frontal Cortex (dtangle): PCs vs Cell Type Proportions",
+       x = "Principal Component",
+       y = "Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+heatmaps with pcs on one axis and cell types on the other- displaying correlations
+
+
+```{r}
+#MuSiC cb analysis
+
+music_cb_df <- read_csv("/Users/judyliang/Downloads/music_props_vs_cereb_gse246183_only_cerebellum.csv")
+colnames(music_cb_df)[1] <- "external_sample_id" 
+
+music_cb_df <- music_cb_df[, c(TRUE, colMeans(music_cb_df[,-1]) != 0)]
+
+#combine with sample metadata
+music_combined_cb_clinicalmd <- left_join(cb_samples, music_cb_df, by = "external_sample_id")
+
+#name columns with cell types
+#cell_types <- c("GC", "BG", "MLI2", "OPC", "AS", "MLI1", "OL", "MG", "PER", "END", "GoC", "PC", "UBC")
+cell_type_fullnames <- c(
+  GC = "Granule Cells",
+  BG = "Bergmann Glia",
+  MLI2 = "Molecular Layer Interneurons 2",
+  OPC = "Oligodendrocyte Progenitor Cells",
+  AS = "Astrocytes",
+  MLI1 = "Molecular Layer Interneurons 1",
+  OL = "Oligodendrocytes",
+  MG = "Microglia",
+  PER = "Pericytes",
+  END = "Endothelial Cells",
+  GoC = "Golgi Cells",
+  PC = "Purkinje Cells",
+  UBC = "Unipolar Brush Cells"
+)
+
+cell_types <- colnames(music_cb_df[,-1])
+music_cb_long <- music_combined_cb_clinicalmd %>%
+  pivot_longer(cols = all_of(cell_types),
+               names_to = "cell_type",
+               values_to = "proportion") %>%
+  mutate(disease_short = forcats::fct_relevel(disease_short, "Control"))
+
+music_cb_long <- music_cb_long %>%
+  mutate(cell_type_full = recode(cell_type, !!!cell_type_fullnames))
+
+ggplot(music_cb_long, aes(x = disease_short, y = proportion, fill = disease_short)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type_full, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Cerebellum (MuSiC): Cell Type Proportions by Disease Type") +
+  guides(fill = "none")
+
+```
+
+```{r}
+#MuSiC cb: music cell type prop vs pcs
+music_cb_with_pcs <- left_join(music_cb_df, sample_pcs_cb, by = "external_sample_id")
+
+music_cb_pcs_long <- music_cb_with_pcs %>%
+  pivot_longer(cols = all_of(cell_types),  # same cell type columns as before
+               names_to = "cell_type",
+               values_to = "proportion")
+  #pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+music_cb_pcs_plot <- music_cb_pcs_long %>% 
+  select(external_sample_id, cell_type, proportion, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+music_cb_pcs_plot <- music_cb_pcs_plot %>%
+  mutate(cell_type_full = recode(cell_type, !!!cell_type_fullnames))
+
+ggplot(music_cb_pcs_plot, aes(x = value, y = proportion)) +
+  geom_point(alpha = 0.6, size = 0.5, aes(color = cell_type_full)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  #facet_grid(PC ~ cell_type, scales = "free_y", space = "free") +
+  facet_wrap(~cell_type + PC, scales = "free_y", ncol = 8) + 
+  labs(title = "Cerebellum: MuSiC Cell Type Proportions vs PCs", x = "PC Value", y = "Proportion") +
+  theme_classic() +
+  guides(color = "none") + 
+  ggpubr::stat_cor()
+```
+
+```{r}
+#heatmap for cb music results (pcs vs cell type proportion)
+
+pc_cols <- c("PC1", "PC2", "PC3", "PC4", "PC5")
+
+music_cb_cor_matrix <- cor(
+  music_cb_with_pcs[, cell_types],
+  music_cb_with_pcs[, pc_cols],
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)  
+
+music_cb_cor_long <- as.data.frame(music_cb_cor_matrix) %>%
+  rownames_to_column("cell_type") %>%
+  pivot_longer(cols = -cell_type, names_to = "PC", values_to = "correlation")
+
+music_cb_cor_long <- music_cb_cor_long %>%
+  mutate(cell_type_full = recode(cell_type, !!!cell_type_fullnames))
+
+ggplot(music_cb_cor_long, aes(x = PC, y = cell_type_full, fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       #midpoint = 0, limits = c(-1, 1), 
+                       name = "Spearman\nCorrelation") +
+  theme_minimal() +
+  geom_text(aes(label = ifelse(is.na(correlation), "NA", round(correlation, 2))), size = 3) +
+  labs(title = "Cerebellum (MuSiC): Cell Types vs PCs",
+       x = "Principal Component",
+       y = "Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10))
+
+
+```
+
+```{r}
+ggplot(music_cb_with_pcs, aes(x = AS, y= PC1)) +
+  geom_point() +
+  ggpubr::stat_cor(method = "spearman") + 
+  geom_smooth(method = "lm", se = FALSE, color = "black") 
+
+  
+```
+
+```{r}
+#frontal cortex MuSiC 
+
+music_fc_df <- read_csv("~/Downloads/music_props_vs_mathys_frontal_cortex_for_jack.csv")
+#rename first column
+colnames(music_fc_df)[1] <- "external_sample_id"
+
+music_fc_df <- music_fc_df[, c(TRUE, colMeans(music_fc_df[,-1]) != 0)]
+
+#combine with sample metadata
+music_combined_fc_clinicalmd <- left_join(fc_samples, music_fc_df, by = "external_sample_id")
+
+# excitatory (Ex) and inhibitory (In) neurons, astrocytes (Ast), oligodendrocytes (Oli), oligodendrocyte precursor cells (OPC), and microglia (Mic)
+cell_types_fullnames_mathys <- c(
+  Ast = "Astrocytes",
+  End = "Endothelial Cells",
+  Ex = "Excitatory Neurons",
+  In = "Inhibitory Neurons",
+  Mic = "Microglia",
+  Oli = "Oligodendrocytes",
+  Opc = "Oligodendrocytes Precursor Cells",
+  Per = "Pericytes"
+)
+#name columns with cell types
+cell_types <- colnames(music_fc_df[,-1])
+
+music_fc_long <- music_combined_fc_clinicalmd %>%
+  pivot_longer(cols = all_of(cell_types),
+               names_to = "cell_type",
+               values_to = "proportion") %>%
+  mutate(disease_short = forcats::fct_relevel(disease_short, "Control"))
+
+music_fc_long <- music_fc_long %>%
+  mutate(cell_type_full = recode(cell_type, !!!cell_types_fullnames_mathys))
+
+ggplot(music_fc_long, aes(x = disease_short, y = proportion, fill = disease_short)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type_full, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Frontal Cortex (MuSiC): Cell Type Proportions by Disease Type") +
+  guides(fill = "none")
+
+'
+```
+
+```{r}
+# MuSiC fc: cell type prop vs pcs
+music_fc_with_pcs <- left_join(music_fc_df, sample_pcs_fc, by = "external_sample_id")
+
+music_fc_pcs_long <- music_fc_with_pcs %>%
+  pivot_longer(cols = all_of(cell_types),  # same cell type columns as before
+               names_to = "cell_type",
+               values_to = "proportion")
+  #pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+music_fc_pcs_plot <- music_fc_pcs_long %>% 
+  select(external_sample_id, cell_type, proportion, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "value")
+
+music_fc_pcs_plot <- music_fc_pcs_plot %>% 
+  mutate(cell_type_full = recode(cell_type, !!!cell_types_fullnames_mathys))
+
+
+music_fc_pcs_plot %>%
+  filter(!cell_type %in% c("In", "Opc")) %>%
+  left_join(fc_samples, by = "external_sample_id") %>%
+  filter(disease_short %in% c("ALS", "FTD", "Control", "ALS/FTD")) %>%
+ggplot(aes(x = value, y = proportion)) +
+  geom_point(alpha = 0.6, size = 0.5, aes(color = disease_short)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  facet_grid(PC ~ cell_type, scales = "free") +
+  labs(title = "Frontal Cortex (MuSiC): Cell Type Proportions vs PCs", x = "PC Value", y = "Proportion") +
+  theme_classic() + 
+  #guides(color ="none") +
+  ggpubr::stat_cor(method = "spearman")
+```
+
+```{r}
+#heatmap for fc music results (pcs vs cell type proportion)
+
+pc_cols <- c("PC1", "PC2", "PC3", "PC4", "PC5")
+
+music_fc_cor_matrix <- cor(
+  music_fc_with_pcs[, cell_types],
+  music_fc_with_pcs[, pc_cols],
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)  
+
+music_fc_cor_long <- as.data.frame(music_fc_cor_matrix) %>%
+  rownames_to_column("cell_type") %>%
+  pivot_longer(cols = -cell_type, names_to = "PC", values_to = "correlation")
+
+ggplot(music_fc_cor_long, aes(x = PC, y = cell_type, fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       #midpoint = 0, limits = c(-1, 1), 
+                       name = "Spearman\nCorrelation") +
+  theme_minimal() +
+  geom_text(aes(label = ifelse(is.na(correlation), "NA", round(correlation, 2))), size = 3) +
+  labs(title = "Frontal Cortex (MuSiC): Cell Types vs PCs",
+       x = "Principal Component",
+       y = "Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10))
+
+```
+
+```{r}
+#music vs dtangle cb results
+
+#need to intersect common cell types:
+#astrocytes(dtangle) = AS (astrocytes), BG (Bergmann glia – a specialized astrocyte type)
+#endothelial(dtangle) =	END (endothelial cells)
+#microglia = MG (microglia)
+#oligodendrocytes	= OL (oligodendrocytes), OPC (oligodendrocyte progenitor cells)
+#neurons =	GC, DCN, UBC, PC, MLI1, MLI2, GoC (all neuron subtypes)
+#create new column for full name of cell type
+
+combined_dt_music_cb_df <- inner_join(music_cb_df, dt_cb_bulk, by = "external_sample_id")
+
+dt_cb_cols <- colnames(dt_cb_bulk)[colnames(dt_cb_bulk) != "external_sample_id"]
+music_cb_cols <- colnames(music_cb_df)[colnames(music_cb_df) != "external_sample_id"]
+
+cor_combined_cb_matrix <- cor(combined_dt_music_cb_df [, dt_cb_cols ],
+                  combined_dt_music_cb_df[, music_cb_cols ],
+                  method = "spearman")
+
+cor_combined_cb_df <- as.data.frame(as.table(cor_combined_cb_matrix))
+colnames(cor_combined_cb_df) <- c("Dtangle", "MuSiC", "Correlation")
+
+ggplot(cor_combined_cb_df, aes(x = MuSiC, y = Dtangle, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +  # display values
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       limit = c(-1, 1), name = "Spearman\nCorrelation") +
+  theme_minimal() +
+  labs(title = "Cerebellum: MuSiC vs Dtangle",
+       x = "MuSiC", 
+       y = "DTangle") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 10),
+        axis.title = element_blank())
+#heatmap
+#scatterplots
+
+```
+
+```{r}
+#music vs dtangle fc results
+
+combined_dt_music_fc_df <- inner_join(music_fc_df, dt_fc_bulk, by = "external_sample_id")
+
+dt_fc_cols <- colnames(dt_fc_bulk)[colnames(dt_fc_bulk) != "external_sample_id"]
+music_fc_cols <- colnames(music_fc_df)[colnames(music_fc_df) != "external_sample_id"]
+
+cor_combined_fc_matrix <- cor(combined_dt_music_fc_df [, dt_fc_cols ],
+                  combined_dt_music_fc_df[, music_fc_cols ],
+                  method = "spearman")
+
+cor_combined_fc_df <- as.data.frame(as.table(cor_combined_fc_matrix))
+colnames(cor_combined_fc_df) <- c("Dtangle", "MuSiC", "Correlation")
+
+ggplot(cor_combined_fc_df, aes(x = MuSiC, y = Dtangle, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +  
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       limit = c(-1, 1), name = "Spearman\nCorrelation") +
+  theme_minimal() +
+  labs(title = "Frontal Cortex: MuSiC vs Dtangle",
+       x = "MuSiC", 
+       y = "DTangle") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 10),
+        axis.title = element_blank())
+```
+
+```{r}
+# Example for one shared cell type:
+ggplot(combined_dt_music_fc_df, aes(x = `Ast`, y = `astrocytes`)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "MuSiC estimate", y = "dtangle estimate", title = "Astrocyte estimates") +
+  theme_classic()
+```
+
+```{r}
+
+```

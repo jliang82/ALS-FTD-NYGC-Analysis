@@ -1,0 +1,1362 @@
+---
+title: "Differential_Gene"
+author: "Judy Liang"
+date: "2025-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(sva)
+library(ggfortify)
+library(limma)
+BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+
+#laod datasets
+load("fc_samples.RData")
+load("fc_deseq2.RData")
+load("cb_samples.RData")
+load("cb_deseq2.RData")
+```
+
+```{r}
+library(limma)
+library(sva)
+library(edgeR)
+library(ggfortify)
+
+# Use sva (surrogate variable analysis) to capture unknown variation
+# Specify variables to be included in the voom() estimates of uncertainty.
+# Recommend including variables with a small number of categories that explain a substantial amount of variation
+#design <- model.matrix( ~ factor(site) + factor(prep), support)
+#age_at_death?
+design <- model.matrix(~factor(disease_short) + factor(site_specimen_collected) + factor(prep) + rin, data=fc_samples)
+gExpr <- DGEList(fcCounts)
+gExpr <- calcNormFactors(gExpr,method = "TMM")
+fcCounts_voom <- voom(gExpr)$E
+
+fc_samples$prep <- as.numeric(fc_samples$prep)
+fc_samples$disease_short <- as.factor(as.character(fc_samples$disease_short))
+fc_samples$site_specimen_collected <- as.factor(fc_samples$site_specimen_collected)
+
+
+#corrected_expr <- removeBatchEffect(fcCounts, batch=known_tech_variables, covariates=sva_results$sv)
+#batch -> categorical
+#covariates are continuous
+
+
+#technical factors in fc that are causing higher variances in expression
+#covariate_df <- dplyr:: select(fc_samples, MEDIAN_5PRIME_TO_3PRIME_BIAS, PCT_MRNA_BASES, PCT_R1_TRANSCRIPT_STRAND_READS, rin, prep)
+#removed MEDIAN_5PRIME_TO_3PRIME_BIAS and rin from list because of the big difference between ALS and FTD disease when looking at the effect of rin and MEDIAN_5PRIME_TO_3PRIME_BIAS across disease groups --> these factors may have significant impact on differences between disease groups ALS and FTD
+covariate_df <- dplyr:: select(fc_samples, PCT_MRNA_BASES, PCT_R1_TRANSCRIPT_STRAND_READS, prep)
+
+covariate_df$prep <- as.numeric(covariate_df$prep)
+
+counts_rbe <- (removeBatchEffect(fcCounts_voom,
+                                       #batch = fc_samples$site_specimen_collected,
+                                       covariates = covariate_df))
+
+#head(counts_rbe)
+
+rownames(fc_samples) <- fc_samples$external_sample_id
+
+```
+
+```{r}
+pca_rbe <- prcomp(t(counts_rbe), scale = TRUE, center = TRUE)
+autoplot(pca_rbe, color = "disease_short", data = fc_samples)
+```
+
+ 
+```{r}
+pca_voom <- prcomp(t(fcCounts_voom), scale = TRUE, center = TRUE)
+autoplot(pca_voom, color = "disease_short", data = fc_samples)
+```
+
+
+
+
+```{r}
+library(patchwork)
+#matrix
+pca_df <- pca_rbe$x %>% as.data.frame() %>%
+ rownames_to_column("external_sample_id") %>%
+  left_join(fc_samples, by= "external_sample_id") 
+
+ggplot(pca_df, aes(x=disease_short, y= PC1)) +
+  geom_boxplot() +
+
+ggplot(pca_df, aes(x=disease_short, y= PC2)) +
+  geom_boxplot() +
+  
+  ggplot(pca_df, aes(x=disease_short, y= PC3)) +
+  geom_boxplot()
+
+```
+
+```{r}
+plot(pca_rbe)
+```
+
+```{r}
+plot(pca_voom)
+```
+
+
+```{r}
+pca_df_voom <- pca_voom$x %>% as.data.frame() %>%
+   rownames_to_column("external_sample_id") %>%
+  left_join(fc_samples, by= "external_sample_id") 
+
+ggplot(pca_df_voom, aes(x=disease_short, y= PC1)) +
+  geom_boxplot() +
+  
+ggplot(pca_df_voom, aes(x=disease_short, y= PC2)) +
+  geom_boxplot() +
+
+ggplot(pca_df_voom, aes(x=disease_short, y= PC3)) +
+  geom_boxplot() 
+```
+
+
+```{r}
+# Create model matrices
+#known technical variables for fc: MEDIAN_5PRIME_TO_3PRIME_BIAS, PCT_MRNA_BASES, PCT_R1_TRANSCRIPT_STRAND_READS + rin + prep
+mod0 <- model.matrix(~PCT_MRNA_BASES+ PCT_R1_TRANSCRIPT_STRAND_READS + prep, data=fc_samples)  # Model without disease condition (null model)
+# Full model includes disease (protected) and known technical covariates
+mod <- model.matrix(~ disease_short + PCT_MRNA_BASES+ PCT_R1_TRANSCRIPT_STRAND_READS + prep, data=fc_samples)  # Model with biological variable of interest (disease condition)
+
+# Estimate surrogate variables (SVs)
+# sva_results contains SVs, unobserved confounders estimated from the expression matrix.
+num_sv <-num.sv(fcCounts_voom, mod, method = "be")
+#sva_results <- sva(fcCounts, mod, mod0)
+
+#object containing the sv variables
+sv_obj <- sva(fcCounts_voom, mod, mod0, n.sv = num_sv)
+
+# Regress out SVs from the voom matrix
+voom_corrected <- removeBatchEffect(fcCounts_voom, covariates = sv_obj$sv)
+
+#fcCounts_voom_sva <- sva_network(fcCounts_voom, num_sv)
+
+pca_sva <- prcomp(t(voom_corrected), center = TRUE, scale = TRUE)
+
+plot(pca_sva)
+```
+
+```{r}
+autoplot(pca_sva, color = "disease_short", data = fc_samples)
+
+```
+
+```{r}
+#Finding genes associated with pc1 and seeing if it aligns with differentially expressed genes found from deSeq
+
+pc1_loadings_fc <- pca_sva$rotation[, 1]  # PC1 loadings
+
+# Top 10 genes (positively corr with PC1) 
+top_pc1_genes_fc <- sort(pc1_loadings_fc, decreasing = TRUE)[1:10]
+print(top_pc1_genes_fc)
+#ENSG00000186350.11 ENSG00000196576.15 ENSG00000178209.15 ENSG00000172081.14 ENSG00000105397.13 ENSG00000168056.15  ENSG00000173548.8 ENSG00000187535.14 ENSG00000165458.14 ENSG00000186174.12
+
+# Top 10 genes (negatively correlated with PC1)
+bottom_pc1_genes_fc <- sort(pc1_loadings_fc, decreasing = FALSE)[1:10]
+print(bottom_pc1_genes_fc)
+#ENSG00000198836.9 ENSG00000198961.10 ENSG00000104381.12 ENSG00000131507.11 ENSG00000129636.12 ENSG00000050748.17 ENSG00000131437.15 ENSG00000175395.16 ENSG00000136531.16 ENSG00000104093.13 
+
+#top 10 genes (disregarding positive or negative corr) with PC1
+top_pc1_genes_fc <- head(order(abs(pca_sva$rotation[,1]), decreasing = TRUE), 10)
+top_pc1_gene_names_fc <- rownames(pca_sva$rotation)[top_pc1_genes_fc]
+print(top_pc1_genes_fc) #row in PC
+print(top_pc1_gene_names_fc) #corresponding name of gene
+
+#deseq model of fc with technical variables included: design = ~ PCT_MRNA_BASES + prep + site_specimen_collected + MEDIAN_3PRIME_BIAS + rin + PCT_INTERGENIC_BASES + disease_short
+#dds2_fc <- DESeq(dds2_fc) 
+res_dds2_fc <- results(dds2_fc)
+
+#order by padj and subset it for padj values < 0.05
+res_padj_fc <- res_dds2_fc[order(res_dds2_fc$padj), ]
+res_sig_fc <- subset(res_padj_fc, padj < 0.05)
+fc_sig_degs <- rownames(res_sig_fc)
+
+#intersect top pc1 gene names in fc and significant degs (based on deseq model with technical variables)
+fc_sig_degs_intersect <- intersect(fc_sig_degs, top_pc1_gene_names_fc)
+fc_sig_degs_intersect
+# "ENSG00000198836.9"  "ENSG00000175395.16" "ENSG00000050748.17" "ENSG00000129636.12" "ENSG00000104093.13" "ENSG00000198961.10" "ENSG00000104381.12" "ENSG00000131437.15" "ENSG00000131507.11" "ENSG00000136531.16"
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#plotting top 5 pcs of fc against log fold change for FTD_vs_Control
+
+#create pc1 dataframe and name the columns gene_id and PC1
+pc1_fc_df <- enframe(pc1_loadings_fc, name = "gene_id", value = "PC1")
+
+pc2_loadings_fc <- pca_sva$rotation[, 2] 
+pc2_fc_df <- enframe(pc2_loadings_fc, name = "gene_id", value = "PC2")
+
+pc3_loadings_fc <- pca_sva$rotation[, 3] 
+pc3_fc_df <- enframe(pc3_loadings_fc, name = "gene_id", value = "PC3")
+
+pc4_loadings_fc <- pca_sva$rotation[, 4] 
+pc4_fc_df <- enframe(pc4_loadings_fc, name = "gene_id", value = "PC4")
+
+pc5_loadings_fc <- pca_sva$rotation[, 5] 
+pc5_fc_df <- enframe(pc5_loadings_fc, name = "gene_id", value = "PC5")
+
+
+#change row names to column for results of FC's FTD vs Control results and add under gene_id column
+#fc_res2_ftd_vs_control <- rownames_to_column(as.data.frame(fc_res2_ftd_vs_control), "gene_id" )
+
+
+#left join pc1 dataframe and FTD vs Control results dataframe by the gene id 
+fc_res2_ftd_vs_control_df <- as.data.frame(fc_res2_ftd_vs_control) %>% rownames_to_column("gene_id")
+pc_fc_FTD_df <- left_join(pc1_fc_df, fc_res2_ftd_vs_control_df, by = "gene_id")
+pc_fc_FTD_df <- left_join(pc2_fc_df, pc_fc_FTD_df)
+pc_fc_FTD_df <- left_join(pc3_fc_df, pc_fc_FTD_df)
+pc_fc_FTD_df <- left_join(pc4_fc_df, pc_fc_FTD_df)
+pc_fc_FTD_df <- left_join(pc5_fc_df, pc_fc_FTD_df)
+
+
+ggplot(pc_fc_FTD_df, aes(x =PC1, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_fc_FTD_df, aes(x =PC2, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_fc_FTD_df, aes(x =PC3, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_fc_FTD_df, aes(x=PC4, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_fc_FTD_df, aes(x =PC5, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) 
+
+pc_fc_FTD_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05") +
+  ggpubr::stat_cor()
+
+```
+
+```{r}
+#change row names to column for results of FC's ALS vs Control results and add under gene_id column
+#fc_res2_als_vs_control <- rownames_to_column(as.data.frame(fc_res2_als_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS vs Control result in fc
+fc_res2_als_vs_control_df <- as.data.frame(fc_res2_als_vs_control) %>% rownames_to_column("gene_id")
+pc_fc_ALS_df <- left_join(pc1_fc_df, fc_res2_als_vs_control_df, by = "gene_id")
+pc_fc_ALS_df <- left_join(pc2_fc_df, pc_fc_ALS_df, by = "gene_id")
+pc_fc_ALS_df <- left_join(pc3_fc_df, pc_fc_ALS_df, by = "gene_id")
+pc_fc_ALS_df <- left_join(pc4_fc_df, pc_fc_ALS_df)
+pc_fc_ALS_df <- left_join(pc5_fc_df, pc_fc_ALS_df)
+
+
+pc_fc_ALS_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05") +
+  ggpubr::stat_cor()
+
+```
+
+```{r}
+#change row names to column for results of FC's ALS/FTD vs Control results and add under gene_id column
+fc_res2_als_ftd_vs_control <- rownames_to_column(as.data.frame(fc_res2_als_ftd_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS/FTD vs Control result in fc
+pc_fc_ALS_FTD_df <- left_join(pc1_fc_df, fc_res2_als_ftd_vs_control, by = "gene_id")
+pc_fc_ALS_FTD_df <- left_join(pc2_fc_df, pc_fc_ALS_FTD_df, by = "gene_id")
+pc_fc_ALS_FTD_df <- left_join(pc3_fc_df, pc_fc_ALS_FTD_df, by = "gene_id")
+pc_fc_ALS_FTD_df <- left_join(pc4_fc_df, pc_fc_ALS_FTD_df, by = "gene_id")
+pc_fc_ALS_FTD_df <- left_join(pc5_fc_df, pc_fc_ALS_FTD_df, by = "gene_id")
+
+
+pc_fc_ALS_FTD_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05")
+
+```
+
+```{r}
+#change row names to column for results of FC's ALS/AD vs Control results and add under gene_id column
+fc_res2_als_ad_vs_control <- rownames_to_column(as.data.frame(fc_res2_als_ad_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS/AD vs Control result in fc
+pc_fc_ALS_AD_df <- left_join(pc1_fc_df, fc_res2_als_ad_vs_control, by = "gene_id")
+pc_fc_ALS_AD_df <- left_join(pc2_fc_df, pc_fc_ALS_AD_df, by = "gene_id")
+pc_fc_ALS_AD_df <- left_join(pc3_fc_df, pc_fc_ALS_AD_df, by = "gene_id")
+pc_fc_ALS_AD_df <- left_join(pc4_fc_df, pc_fc_ALS_AD_df, by = "gene_id")
+pc_fc_ALS_AD_df <- left_join(pc5_fc_df, pc_fc_ALS_AD_df, by = "gene_id")
+
+
+pc_fc_ALS_AD_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05")
+
+```
+
+```{r}
+# pc2_loadings_fc <- pca_sva$rotation[, 2] 
+# pc2_fc_df <- enframe(pc2_loadings_fc, name = "gene_id", value = "PC2")
+# 
+# pc2_fc_df <- left_join(pc2_fc_df, fc_res2_ftd_vs_control, by = "gene_id")
+# 
+# pc2_fc_df %>%
+# ggplot(aes(x =PC2, y=log2FoldChange, color = padj < 0.05)) + 
+#   geom_point(size = 0.5)
+
+```
+
+top 5 pcs 
+correlate PCs against log2foldchange
+data frame containing 
+ggplot with three columns (comparison, PC, foldchange, PC_loading, padj)
+scatterplot with PC against fold change
+facet_wrap/grid by comparison + PC
+
+for each disease comparison
+
+```{r}
+library(patchwork)
+pca_df_sva<- pca_sva$x %>% as.data.frame() %>%
+   rownames_to_column("external_sample_id") %>%
+  left_join(fc_samples, by= "external_sample_id") 
+
+ggplot(pca_df_sva, aes(x=disease_short, y= PC1)) +
+  geom_boxplot() +
+  
+ggplot(pca_df_voom, aes(x=disease_short, y= PC2)) +
+  geom_boxplot() +
+
+ggplot(pca_df_voom, aes(x=disease_short, y= PC3)) +
+  geom_boxplot() 
+
+```
+
+```{r}
+library(umap)
+#autoplot(pca_sva, color = "disease_short", data = fc_samples)
+
+umap_fc_sva <- umap(pca_sva$x[,1:5])
+umap_fc_df <- as.data.frame(umap_fc_sva$layout)
+#setting names of data frame
+names(umap_fc_df) <- c("umap1", "umap2") 
+#rownames to column
+rownames_to_column(umap_fc_df, "external_sample_id") %>%
+  left_join(fc_samples, by = "external_sample_id") %>%
+  ggplot(aes(x=umap1, y=umap2, color= disease_short)) +
+  geom_point()
+
+```
+
+
+
+```{r}
+# 
+# library(RUVSeq)
+# 
+# # Create SeqExpressionSet
+# set <- newSeqExpressionSet(as.matrix(fcCounts_voom),
+#                            phenoData = data.frame(fc_samples, row.names=colnames(fcCounts_voom)))
+# 
+# # Use RUVr (e.g., if you don’t have controls or replicates)
+# design <- model.matrix(~ disease_short, data = fc_samples)
+# fit <- edgeR::glmFit(edgeR::DGEList(counts), design)
+# 
+# residuals <- residuals(fit, type = "deviance")
+# 
+# set_ruv <- RUVr(set, cIdx = rownames(counts), k = 5, residuals)
+# 
+# ruv_corrected_counts <- normCounts(set_ruv)
+
+```
+
+
+```{r}
+#cerebellum - regressing out variations
+library(limma)
+library(sva)
+library(edgeR)
+library(ggfortify)
+
+#technical factors in cb that are causing higher variances in expression: PCT_MRNA_BASES + prep + site_specimen_collected + MEDIAN_3PRIME_BIAS + rin + PCT_INTERGENIC_BASES + disease_short
+#design <- model.matrix(~factor(disease_short) + factor(site_specimen_collected) + factor(prep) + rin, data=cb_samples)
+gExpr <- DGEList(cbCounts)
+gExpr <- calcNormFactors(gExpr,method = "TMM")
+cbCounts_voom <- voom(gExpr)$E
+
+cb_samples$prep <- as.numeric(cb_samples$prep)
+cb_samples$disease_short <- as.factor(as.character(cb_samples$disease_short))
+cb_samples$site_specimen_collected <- as.factor(cb_samples$site_specimen_collected)
+
+#corrected_expr <- removeBatchEffect(fcCounts, batch=known_tech_variables, covariates=sva_results$sv)
+#batch -> categorical
+#covariates are continuous
+
+#covariate_df <- dplyr:: select(cb_samples, PCT_MRNA_BASES, prep, site_specimen_collected, MEDIAN_3PRIME_BIAS, rin, PCT_INTERGENIC_BASES, disease_short)
+#removed rin from list because of the big difference between ALS and FTD disease when looking at the effect of rin and MEDIAN_5PRIME_TO_3PRIME_BIAS across disease groups --> these factors may have signficant impact on differences between disease groups ALS and FTD
+covariate_cb_df <- dplyr:: select(cb_samples, PCT_MRNA_BASES, prep, MEDIAN_3PRIME_BIAS, rin, PCT_INTERGENIC_BASES)
+
+covariate_cb_df$prep <- as.numeric(covariate_cb_df$prep)
+
+#13684 sites are NA
+cbCounts_rbe <- (removeBatchEffect(cbCounts_voom,
+                                       #batch = cb_samples$site_specimen_collected,
+                                       covariates = covariate_cb_df))
+
+#head(cbCounts_rbe)
+
+rownames(cb_samples) <- cb_samples$external_sample_id
+
+```
+
+```{r}
+pca_cb_rbe <- prcomp(t(cbCounts_rbe), scale = TRUE, center = TRUE)
+autoplot(pca_cb_rbe, color = "disease_short", data = cb_samples)
+```
+ 
+```{r}
+plot(pca_cb_rbe)
+```
+
+
+```{r}
+library(patchwork)
+#matrix
+pca_cb_df <- pca_cb_rbe$x %>% as.data.frame() %>%
+ rownames_to_column("external_sample_id") %>%
+  left_join(cb_samples, by= "external_sample_id") 
+
+ggplot(pca_cb_df, aes(x=disease_short, y= PC1)) +
+  geom_boxplot() +
+
+ggplot(pca_cb_df, aes(x=disease_short, y= PC2)) +
+  geom_boxplot() +
+  
+  ggplot(pca_cb_df, aes(x=disease_short, y= PC3)) +
+  geom_boxplot()
+
+```
+
+```{r}
+pca_cb_voom <- prcomp(t(cbCounts_voom), scale = TRUE, center = TRUE)
+autoplot(pca_cb_voom, color = "disease_short", data = cb_samples)
+```
+
+```{r}
+plot(pca_cb_voom)
+```
+
+```{r}
+# Create model matrices
+#known technical variables for cb: PCT_MRNA_BASES, MEDIAN_3PRIME_BIAS, PCT_INTERGENIC_BASES + rin + prep
+mod0_cb <- model.matrix(~rin + prep + MEDIAN_3PRIME_BIAS + PCT_INTERGENIC_BASES, data=cb_samples)  # Model without disease condition (null model)
+#mod0_cb <- model.matrix(~1, data=cb_samples)
+# Full model includes disease (protected) and known technical covariates
+mod_cb <- model.matrix(~ disease_short + rin + prep + MEDIAN_3PRIME_BIAS + PCT_INTERGENIC_BASES, data=cb_samples)  # Model with biological variable of interest (disease condition)
+#mod_cb <- model.matrix(~ disease_short, data=cb_samples) 
+
+# Estimate surrogate variables (SVs)
+# sva_results contains SVs, unobserved confounders estimated from the expression matrix.
+num_sv_cb <-num.sv(cbCounts_voom, mod_cb, method = "be")
+#sva_results <- sva(fcCounts, mod, mod0)
+
+#object containing the sv variables
+sv_obj_cb <- sva(cbCounts_voom, mod_cb, mod0_cb, n.sv = num_sv_cb)
+
+#correlation matrix checking if sv variables are correlated to technical variables but not disease_short
+
+# Regress out SVs from the voom matrix
+voom_corrected_cb <- removeBatchEffect(cbCounts_voom, covariates = sv_obj_cb$sv)
+
+#fcCounts_voom_sva <- sva_network(fcCounts_voom, num_sv)
+
+pca_cb_sva <- prcomp(t(voom_corrected_cb), center = TRUE, scale = TRUE)
+
+plot(pca_cb_sva)
+```
+
+```{r}
+#cb sig degs
+pc1_loadings_cb<- pca_cb_sva$rotation[, 1]  # PC1 loadings in cb
+
+# Top 10 genes(positively corr with PC1) 
+top_pc1_genes_cb <- sort(pc1_loadings_cb, decreasing = TRUE)[1:10]
+print(top_pc1_genes_cb)
+#ENSG00000172667.11 ENSG00000187231.14 ENSG00000164114.19 ENSG00000196586.14 ENSG00000152332.16 ENSG00000091039.17 ENSG00000014123.10  ENSG00000184203.8 ENSG00000085832.17 ENSG00000134352.20 
+
+# Top 10 genes most negatively correlated with PC1
+bottom_pc1_genes_cb <- sort(pc1_loadings_cb, decreasing = FALSE)[1:10]
+print(bottom_pc1_genes_cb)
+# ENSG00000128159.12 ENSG00000138834.12 ENSG00000167861.16 ENSG00000065717.15 ENSG00000154832.14 ENSG00000128482.16 ENSG00000198910.13 ENSG00000178950.17 ENSG00000137802.14 ENSG00000146830.10  
+
+#top 10 genes (not regarding postivie or negative) with PC1
+top_pc1_genes_cb <- head(order(abs(pca_cb_sva$rotation[,1]), decreasing = TRUE), 10)
+top_pc1_gene_names_cb <- rownames(pca_cb_sva$rotation)[top_pc1_genes_cb]
+print(top_pc1_genes_cb) #row in PC
+print(top_pc1_gene_names_cb) #corresponding name of gene
+
+#deseq model of cb with technical variables included:  design = ~ PCT_MRNA_BASES + prep + site_specimen_collected + MEDIAN_3PRIME_BIAS + rin + PCT_INTERGENIC_BASES + disease_short
+#dds2_fc <- DESeq(dds2_fc) 
+res_dds2_cb <- results(dds2_cb)
+
+#order by padj and subset it for padj values < 0.05
+res_padj_cb <- res_dds2_cb[order(res_dds2_cb$padj), ]
+res_sig_cb <- subset(res_padj_cb, padj < 0.05)
+cb_sig_degs <- rownames(res_sig_cb)
+
+#intersect top pc1 gene names in fc and significant degs (based on deseq model with technical variables)
+cb_sig_degs_intersect <- intersect(cb_sig_degs, top_pc1_gene_names_cb)
+sort(cb_sig_degs_intersect, decreasing= TRUE)
+# "ENSG00000154832.14" "ENSG00000167861.16" "ENSG00000178950.17" "ENSG00000128159.12" "ENSG00000198910.13" "ENSG00000137802.14" "ENSG00000128482.16" "ENSG00000065717.15"
+
+```
+
+```{r}
+#plotting top 5 pcs of cb against log fold change for FTD_vs_Control
+
+#create pc1 dataframe and name the columns gene_id and PC1
+pc1_cb_df <- enframe(pc1_loadings_cb, name = "gene_id", value = "PC1")
+
+pc2_loadings_cb <- pca_cb_sva$rotation[, 2] 
+pc2_cb_df <- enframe(pc2_loadings_cb, name = "gene_id", value = "PC2")
+
+pc3_loadings_cb <- pca_cb_sva$rotation[, 3] 
+pc3_cb_df <- enframe(pc3_loadings_cb, name = "gene_id", value = "PC3")
+
+pc4_loadings_cb <- pca_cb_sva$rotation[, 4] 
+pc4_cb_df <- enframe(pc4_loadings_cb, name = "gene_id", value = "PC4")
+
+pc5_loadings_cb <- pca_cb_sva$rotation[, 5] 
+pc5_cb_df <- enframe(pc5_loadings_cb, name = "gene_id", value = "PC5")
+
+
+#change row names to column for results of cb's FTD vs Control results and add under gene_id column
+cb_res2_ftd_vs_control <- rownames_to_column(as.data.frame(cb_res2_ftd_vs_control), "gene_id" )
+
+#left join pc1 dataframe and FTD vs Control results dataframe by the gene id 
+pc_cb_FTD_df <- left_join(pc1_cb_df, cb_res2_ftd_vs_control, by = "gene_id")
+pc_cb_FTD_df <- left_join(pc2_cb_df, pc_cb_FTD_df, by = "gene_id")
+pc_cb_FTD_df <- left_join(pc3_cb_df, pc_cb_FTD_df, by = "gene_id")
+pc_cb_FTD_df <- left_join(pc4_cb_df, pc_cb_FTD_df, by = "gene_id")
+pc_cb_FTD_df <- left_join(pc5_cb_df, pc_cb_FTD_df, by = "gene_id")
+
+
+ggplot(pc_cb_FTD_df, aes(x =PC1, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_cb_FTD_df, aes(x =PC2, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_cb_FTD_df, aes(x =PC3, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_cb_FTD_df, aes(x=PC4, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) + 
+ggplot(pc_cb_FTD_df, aes(x =PC5, y=log2FoldChange, color = padj < 0.05)) + 
+  geom_point(size = 0.5) 
+
+pc_cb_FTD_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05") +
+  ggpubr::stat_cor()
+
+
+```
+
+```{r}
+#change row names to column for results of CB's ALS vs Control results and add under gene_id column
+cb_res2_als_vs_control <- rownames_to_column(as.data.frame(cb_res2_als_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS vs Control result in fc
+pc_cb_ALS_df <- left_join(pc1_cb_df, cb_res2_als_vs_control, by = "gene_id")
+pc_cb_ALS_df <- left_join(pc2_cb_df, pc_cb_ALS_df, by = "gene_id")
+pc_cb_ALS_df <- left_join(pc3_cb_df, pc_cb_ALS_df, by = "gene_id")
+pc_cb_ALS_df <- left_join(pc4_cb_df, pc_cb_ALS_df, by = "gene_id")
+pc_cb_ALS_df <- left_join(pc5_cb_df, pc_cb_ALS_df, by = "gene_id")
+
+
+pc_cb_ALS_df %>%
+  filter(padj < 0.05) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05") +
+  ggpubr::stat_cor()
+
+```
+
+```{r}
+#change row names to column for results of CB's ALS/FTD vs Control results and add under gene_id column
+cb_res2_als_ftd_vs_control <- rownames_to_column(as.data.frame(cb_res2_als_ftd_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS/FTD vs Control result in fc
+pc_cb_ALS_FTD_df <- left_join(pc1_cb_df, cb_res2_als_ftd_vs_control, by = "gene_id")
+pc_cb_ALS_FTD_df <- left_join(pc2_cb_df, pc_cb_ALS_FTD_df, by = "gene_id")
+pc_cb_ALS_FTD_df <- left_join(pc3_cb_df, pc_cb_ALS_FTD_df, by = "gene_id")
+pc_cb_ALS_FTD_df <- left_join(pc4_cb_df, pc_cb_ALS_FTD_df, by = "gene_id")
+pc_cb_ALS_FTD_df <- left_join(pc5_cb_df, pc_cb_ALS_FTD_df, by = "gene_id")
+
+
+pc_cb_ALS_FTD_df %>%
+  filter(padj < 0.05) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05") +
+  ggpubr::stat_cor()
+```
+
+```{r}
+#change row names to column for results of CB's ALS/AD vs Control results and add under gene_id column
+cb_res2_als_ad_vs_control <- rownames_to_column(as.data.frame(cb_res2_als_ad_vs_control), "gene_id")
+
+#create combined data frame for PCs 1-5 and DEGs in ALS/AD vs Control result in fc
+pc_cb_ALS_AD_df <- left_join(pc1_cb_df, cb_res2_als_ad_vs_control, by = "gene_id")
+pc_cb_ALS_AD_df <- left_join(pc2_cb_df, pc_cb_ALS_AD_df, by = "gene_id")
+pc_cb_ALS_AD_df <- left_join(pc3_cb_df, pc_cb_ALS_AD_df, by = "gene_id")
+pc_cb_ALS_AD_df <- left_join(pc4_cb_df, pc_cb_ALS_AD_df, by = "gene_id")
+pc_cb_ALS_AD_df <- left_join(pc5_cb_df, pc_cb_ALS_AD_df, by = "gene_id")
+
+
+pc_cb_ALS_AD_df %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "PC_value") %>%
+  ggplot(aes(x = PC_value, y = log2FoldChange, color = padj < 0.05)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ PC, nrow = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Principal Component Value", y = "log2 Fold Change", color = "padj < 0.05")
+
+```
+
+```{r}
+library(umap)
+autoplot(pca_cb_sva, color = "disease_short", data = cb_samples)
+
+umap_cb_sva <- umap(pca_cb_sva$x[,1:5])
+umap_cb_df <- as.data.frame(umap_cb_sva$layout)
+#setting names of data frame
+names(umap_cb_df) <- c("umap1", "umap2") 
+#rownames to column
+rownames_to_column(umap_cb_df, "external_sample_id") %>%
+  left_join(cb_samples, by = "external_sample_id") %>%
+  ggplot(aes(x=umap1, y=umap2, color= disease_short)) +
+  geom_point()
+```
+
+
+```{r}
+library(patchwork)
+pca_cb_df_sva<- pca_cb_sva$x %>% as.data.frame() %>%
+   rownames_to_column("external_sample_id") %>%
+  left_join(cb_samples, by= "external_sample_id") 
+
+ggplot(pca_cb_df_sva, aes(x=disease_short, y= PC1)) +
+  geom_boxplot() +
+  
+ggplot(pca_cb_df_sva, aes(x=disease_short, y= PC2)) +
+  geom_boxplot() +
+
+ggplot(pca_cb_df_sva, aes(x=disease_short, y= PC3)) +
+  geom_boxplot() 
+
+```
+
+```{r}
+#comparing log2 fold changes between the different tissues and disease groups 
+
+#inner join on gene name between the results of fc and cb for ALS vs control 
+merged_als_vs_control <- merge(as.data.frame(fc_res2_als_vs_control), as.data.frame(cb_res2_als_vs_control), by="row.names")
+merged_als_vs_control
+
+ggplot(merged_als_vs_control, aes(x = log2FoldChange.x, y = log2FoldChange.y, color = log2FoldChange.x)) +
+  geom_point() 
+
+```
+
+
+
+marker analysis:
+```{r}
+load("/Users/judyliang/Documents/Towfique/ALS_FTD/kelley_markers.RData")
+gene_names <- read_tsv("gencode.v30.gene_meta.tsv")
+
+#take kelley data and make into data frame
+#names(kelley) -> Returns the names of the list, e.g., c("Astrocytes", "Microglia", "Neurons", "Oligos")
+#lapply(names(kelley), function(celltype) { ... }) For each celltype, it:
+# extracts the vector of genes for that cell type using kelley[[celltype]]
+# Constructs a data frame with two columns: gene (gene names), cell_type (current cell type, repeated for each gene)
+# stringsAsFactors = FALSE: avoids automatic conversion of character columns into factors (important for flexibility in later steps).
+kelley_df <- do.call(rbind, lapply(names(kelley), function(celltype) {
+  data.frame(gene_name = kelley[[celltype]], cell_type = celltype, stringsAsFactors = FALSE)
+}))
+
+
+#add in gene IDs from gene meta
+kelley_with_ids <- kelley_df %>% inner_join(gene_names, by= "gene_name")
+kelley_with_ids 
+
+#join that with PC loadings by gene ID
+genes_with_pcs_fc <- kelley_with_ids %>% inner_join(pc1_fc_df, kelley_with_ids, by = "gene_id")
+
+# pc2_centered <- pc2_fc_df
+# pc2_centered <- pc2_centered %>%mutate(PC2 = PC2 - mean(PC2, na.rm = TRUE))
+# genes_with_pcs_fc <- genes_with_pcs_fc %>% inner_join(pc2_centered)
+
+genes_with_pcs_fc <- genes_with_pcs_fc %>% inner_join(pc2_fc_df)
+genes_with_pcs_fc <- genes_with_pcs_fc %>% inner_join(pc3_fc_df)
+genes_with_pcs_fc <- genes_with_pcs_fc %>% inner_join(pc4_fc_df)
+genes_with_pcs_fc <- genes_with_pcs_fc %>% inner_join(pc5_fc_df)
+#368 vs 392
+
+#plot distribution of pc loadings by cell types
+
+#reshape dataframe to put PCs in one column and their values under a new column called "loading"
+genes_with_pcs_fc_long <- genes_with_pcs_fc %>%
+  pivot_longer(cols = starts_with("PC"),
+               names_to = "PC",
+               values_to = "loading")
+
+#create distribution of pc loadings by cell type
+ggplot(genes_with_pcs_fc_long, aes(x = cell_type, y = loading)) +
+  geom_boxplot(outlier.shape = NA, color = "black") +
+  geom_jitter(size = 0.5) +
+  facet_wrap(~ PC, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Distribution of PC Loadings by Cell Type in Frontal Cortex",
+       x = "Cell Type",
+       y = "Loading") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept =0)
+        
+```
+
+```{r}
+#join that with PC loadings by gene ID
+genes_with_pcs_cb <- kelley_with_ids %>% inner_join(pc1_cb_df, kelley_with_ids, by = "gene_id")
+genes_with_pcs_cb <- genes_with_pcs_cb %>% inner_join(pc2_cb_df)
+genes_with_pcs_cb <- genes_with_pcs_cb %>% inner_join(pc3_cb_df)
+genes_with_pcs_cb <- genes_with_pcs_cb %>% inner_join(pc4_cb_df)
+genes_with_pcs_cb <- genes_with_pcs_cb %>% inner_join(pc5_cb_df)
+
+#plot distribution of pc loadings by cell types
+#reshape dataframe to put PCs in one column and their values under a new column called "loading"
+genes_with_pcs_cb_long <- genes_with_pcs_cb %>%
+  pivot_longer(cols = starts_with("PC"),
+               names_to = "PC",
+               values_to = "loading")
+
+#create distribution of pc loadings by cell type
+ggplot(genes_with_pcs_cb_long, aes(x = cell_type, y = loading)) +
+  geom_boxplot(outlier.shape = NA, color = "black") +
+  geom_jitter(size= 0.5) +
+  facet_wrap(~ PC, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Distribution of PC Loadings by Cell Type in Cerebellum",
+       x = "Cell Type",
+       y = "Loading") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+```
+neurons have clear negative loading for certain pcs
+
+
+gsea analysis
+stat test to show enrichment
+
+```{r}
+
+#go back to original column layout (each PC has own column)
+#genes_with_pcs_fc <- genes_with_pcs_fc %>%
+#  tidyr::pivot_wider(names_from = PC, values_from = loading)
+
+# pc1_fc_vec <- pc1_fc_df$PC1
+# names(pc1_fc_vec) <- pc1_fc_df$gene_id
+# pc1_fc_vec <- pc1_fc_vec[order(pc1_fc_vec, decreasing = TRUE)]
+
+##database
+kelley_gsea <- select(kelley_with_ids, term_id = cell_type, gene = gene_id)
+
+#GSEA(pc1_fc_vec, TERM2GENE = kelley_gsea)
+
+#heatmap of cell types against PC for all 5 PCs in FC and CB
+#use function to 
+#gene loading plots (genes contributing to PCs)
+#high loadings vs low loadings on PC --> gene entology analysis
+#PCs against PC (write function to` display all the comparisons, for the matrix)
+
+```
+
+```{r}
+#neuron negatively loaded whereas astrocytes and microglia
+
+run_pc_gsea <- function(pc_name, pc_df, term2gene_df) {
+  # Create a named numeric vector of PC loadings
+  pc_vec <- pc_df[[pc_name]]
+  names(pc_vec) <- pc_df$gene_id
+
+  # Remove NA values and sort descending
+  pc_vec <- sort(pc_vec[!is.na(pc_vec)], decreasing = TRUE)
+  
+  
+  # Use scoreType = "pos" only for PC2
+  #scoreType <- if (pc_name == "PC2") "pos" else "std"
+
+  # Run GSEA
+  gsea_result <- GSEA(geneList = pc_vec, TERM2GENE = term2gene_df, verbose= TRUE, pvalueCutoff = 1, minGSSize = 1,
+    maxGSSize = 10000, nPermSimple = 10000, eps = 0)#, scoreType = scoreType)
+
+  # Check if result is empty
+  #if (is.null(gsea_result) || nrow(as.data.frame(gsea_result)) == 0) return(NULL)
+
+  # Extract NES, p.adjust, and significance label
+  result_df <- as.data.frame(gsea_result) %>%
+    select(cell_type = ID, NES, p.adjust) %>%
+    #rename("cell_type" = "ID") %>%
+    mutate(
+      PC = pc_name,
+      sig_label = case_when(
+        is.na(p.adjust) ~ ".",
+        p.adjust < 0.0001 ~ "***",
+        p.adjust < 0.001 ~ "**",
+        p.adjust < 0.05 ~ "*",
+        TRUE ~ "."
+      )
+    )
+
+  return(result_df)
+}
+# Scale the loadings for each PC (to standardize the range)
+#genes_with_pcs_fc <- genes_with_pcs_fc %>%
+#  mutate(across(starts_with("PC"), ~ scale(.)[, 1]))
+
+pcs <- paste0("PC", 1:5)
+gsea_fc_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = genes_with_pcs_fc, term2gene_df = kelley_gsea))
+gsea_fc_pcs <- gsea_fc_pcs %>% tibble::rownames_to_column(var = "rowname") %>% select(-rowname) 
+
+
+pc2<- "PC2"
+gsea_fc_pc_2 <- purrr::map_dfr(pc2, ~run_pc_gsea(.x, pc_df = pc2_fc_df, term2gene_df = kelley_gsea))
+gsea_fc_pc_2 <- gsea_fc_pcs %>% tibble::rownames_to_column(var = "rowname") %>% select(-rowname) 
+
+genes_with_pcs_fc <- genes_with_pcs_fc %>%
+  mutate(PC2 = PC2 - mean(PC2, na.rm = TRUE))
+#warning:
+#filter out small/poorly annotated gene sets
+#filtered_pathways <- pathways[sapply(pathways, function(p) length(p) >= 15 & length(p) <= 500)]
+
+#summary(pc_vec)
+#table(pc_vec > 0)
+
+failing_pathways <- gsea_fc_pcs[is.na(gsea_fc_pcs$p.adjust), ]
+print(failing_pathways$ID)
+
+```
+
+```{r}
+# genes_with_pcs_fc <- genes_with_pcs_fc %>%
+#   pivot_longer(cols = starts_with("PC"),
+#                names_to = "PC",
+#                values_to = "loading")
+
+#create distribution of pc loadings by cell type
+ggplot(genes_with_pcs_fc_long, aes(x = cell_type, y = loading)) +
+  geom_boxplot(outlier.shape = NA, color = "black") +
+  geom_jitter(size = 0.5) +
+  facet_wrap(~ PC, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Distribution of PC Loadings by Cell Type in Frontal Cortex (scaled)",
+       x = "Cell Type",
+       y = "Loading") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept =0)
+
+```
+
+```{r}
+ggplot(gsea_fc_pcs, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Kelley Cell Types by PC for Frontal Cortex",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Check loadings for PC2 alone (just the PC2 column)
+pc2_loadings_astrocytes <- genes_with_pcs_fc %>%
+  filter(cell_type == "Astrocytes") %>%
+  select(gene_id, PC2) %>%
+  arrange(desc(PC2))
+
+# Check loadings for all PCs (PC1 to PC5)
+all_pcs_loadings_astrocytes <- genes_with_pcs_fc %>%
+  filter(cell_type == "Astrocytes") %>%
+  select(gene_id, starts_with("PC")) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "loading") %>%
+  arrange(desc(loading))
+
+# Inspect the results
+head(pc2_loadings_astrocytes)
+head(all_pcs_loadings_astrocytes)
+```
+
+
+```{r}
+# Check GSEA inputs for PC2 alone
+pc2_vec <- genes_with_pcs_fc$PC2
+names(pc2_vec) <- genes_with_pcs_fc$gene_id
+
+# Check GSEA inputs for all PCs (PC1-5)
+all_pcs_vecs <- genes_with_pcs_fc %>%
+  select(gene_id, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "loading") %>%
+  arrange(desc(loading)) 
+
+# Check the top of the input data for both cases
+head(pc2_vec)
+head(all_pcs_vecs)
+
+```
+
+```{r}
+# Check the GSEA result for PC2 alone
+pc2_gsea_result <- run_pc_gsea("PC2", pc_df = genes_with_pcs_fc, term2gene_df = kelley_gsea)
+pc2_gsea_result_astrocyte <- pc2_gsea_result %>% filter(cell_type == "astrocyte")
+
+# Check the GSEA result for PCs 1-5
+gsea_fc_pcs_astrocyte <- gsea_fc_pcs %>% filter(cell_type == "astrocyte")
+
+# Compare the results for astrocytes
+pc2_gsea_result_astrocyte
+gsea_fc_pcs_astrocyte
+```
+
+```{r}
+library(fgsea)
+
+pcs <- "PC5"
+
+pc_vec <- pc_df[[pc_name]]
+names(pc_vec) <- pc_df$gene_id
+pc_vec <- sort(pc_vec[!is.na(pc_vec)], decreasing = TRUE)
+
+pathways <- term2gene_df %>%
+  filter(term_id %in% c("Oligos", "Microglia")) %>%
+  group_by(term_id) %>%
+  summarise(genes = list(gene)) %>%
+  deframe()
+
+fgsea_res <- fgseaSimple(pathways, stats = pc_vec, nperm = 10000, scoreType = "std")
+print(fgsea_res)
+
+```
+```{r}
+library(fgsea)
+library(dplyr)
+
+run_pc_fgsea <- function(pc_name, pc_df, term2gene_df, nperm = 10000) {
+  # Create named numeric vector of PC loadings
+  pc_vec <- pc_df[[pc_name]]
+  names(pc_vec) <- pc_df$gene_id
+  pc_vec <- sort(pc_vec[!is.na(pc_vec)], decreasing = TRUE)
+
+  # Prepare pathways list: named list of gene vectors by pathway
+  pathways <- term2gene_df %>%
+    group_by(term_id) %>%
+    summarise(genes = list(gene)) %>%
+    deframe()
+
+  # Run fgsea
+  fgsea_res <- fgseaSimple(
+    pathways = pathways,
+    stats = pc_vec,
+    nperm = nperm,
+    scoreType = "std"
+  )
+
+  # Format output like your previous df
+  result_df <- fgsea_res %>%
+    as_tibble() %>%
+    rename(cell_type = pathway, p.adjust = padj) %>%
+    mutate(
+      PC = pc_name,
+      sig_label = case_when(
+        p.adjust < 0.0001 ~ "***",
+        p.adjust < 0.001 ~ "**",
+        p.adjust < 0.05 ~ "*",
+        TRUE ~ "."
+      )
+    ) %>%
+    select(cell_type, NES, pval, p.adjust, PC, sig_label)
+
+  return(result_df)
+}
+
+pcs <- paste0("PC", 1:5)
+fgsea_cb_pcs <- purrr::map_dfr(pcs, ~run_pc_fgsea(.x, pc_df = genes_with_pcs_cb, term2gene_df = kelley_gsea))
+fgsea_cb_pcs <- fgsea_cb_pcs %>% tibble::rownames_to_column(var = "rowname") %>% select(-rowname) 
+
+```
+
+
+```{r}
+genes_with_pcs_cb <- genes_with_pcs_cb %>%
+  tidyr::pivot_wider(names_from = PC, values_from = loading)
+
+pcs <- paste0("PC", 1:5)
+gsea_cb_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = genes_with_pcs_cb, term2gene_df = kelley_gsea))
+gsea_cb_pcs <- gsea_cb_pcs %>% tibble::rownames_to_column(var = "rowname") %>% select(-rowname) 
+
+
+ggplot(fgsea_cb_pcs, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Kelley Cell Types by PC for Cerebellum",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#hallmark gene set
+
+hallmark_file <-"~/Downloads/h.all.v7.2.symbols.gmt"
+
+hallmarks <- read.gmt(hallmark_file)
+
+hallmarks_with_ids <- hallmarks %>% inner_join(genes_with_pcs_fc, by =c("gene" = "gene_name"))%>%
+  select(term, gene_id) %>%
+  rename("gene" = "gene_id")
+
+pcs <- paste0("PC", 1:5)
+gsea_fc_hm <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = genes_with_pcs_fc, term2gene_df = hallmarks_with_ids))
+
+ggplot(gsea_fc_hm, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Hallmark genes by PC for Frontal Cortex",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#gsea analysis on mouse genes-> run through what is 
+
+mouse_marker_genes <- readRDS("/Users/judyliang/Documents/Towfique/ALS_FTD/mouseMarkerGenesCombined.rds")
+
+# Extract cortex and cerebellum marker genes
+mouse_cortex_genes <- mouse_marker_genes[["Cortex"]]
+mouse_cerebellum_genes <- mouse_marker_genes[["Cerebellum"]]
+
+# Convert mouse to human gene symbols for cortex
+human_cortex <- purrr::map(mouse_cortex_genes, ~{
+  homologs <- homologene::homologene(.x, inTax = 10090, outTax = 9606)
+  unique(homologs$`9606`)
+})
+
+# Convert mouse to human gene symbols for cerebellum
+human_cerebellum <- purrr::map(mouse_cerebellum_genes, ~{
+  homologs <- homologene::homologene(.x, inTax = 10090, outTax = 9606)
+  unique(homologs$`9606`)
+})
+
+human_cortex_df <- do.call(rbind, lapply(names(human_cortex), function(celltype) {
+  data.frame(gene = human_cortex[[celltype]], term = celltype, stringsAsFactors = FALSE)
+})) %>%
+  rename("term_id" = "term")
+
+human_cerebellum_df <- do.call(rbind, lapply(names(human_cerebellum), function(celltype) {
+  data.frame(gene = human_cerebellum[[celltype]], term = celltype, stringsAsFactors = FALSE)
+})) %>%
+  rename("term_id" = "term")
+
+#reorder columns
+human_cortex_df <- human_cortex_df[, c("term_id", "gene")]
+human_cerebellum_df <- human_cerebellum_df[, c("term_id", "gene")]
+
+gene_names_unique <- gene_names %>%
+  distinct(gene_name, .keep_all = TRUE)  # Keep first match per symbol
+
+human_cortex_with_ids <- human_cortex_df%>% inner_join(gene_names_unique, by= c("gene"="gene_name"))
+human_cerebellum_with_ids <- human_cerebellum_df%>% inner_join(gene_names_unique, by= c("gene"="gene_name"))
+
+
+#nxp_cortex_files <- list.files("data/neuroexpresso/Cortex_combined", full.names = TRUE)
+#cortex_cell_types <- basename(nxp_cortex_files)
+
+#nxp_cere_files <- list.files("data/neuroexpresso/Cerebellum_combined/", full.names = TRUE)
+#cere_cell_types <- basename(nxp_cere_files)
+
+#nxp_cortex <- purrr::map(nxp_cortex_files, ~{
+#  mouse_genes <- readLines(.x) 
+#  human_homologene <- homologene::homologene(mouse_genes, inTax = 10090, outTax = 9606 )
+#  human_homologene <- human_homologene[!duplicated(human_homologene) | !duplicated(human_homologene),]$`9606`  
+#  return(human_homologene)
+#})
+
+#nxp_cere <- purrr::map(nxp_cere_files, ~{
+#  mouse_genes <- readLines(.x) 
+#  human_homologene <- homologene::homologene(mouse_genes, inTax = 10090, outTax = 9606 )
+#  human_homologene <- human_homologene[!duplicated(human_homologene) | !duplicated(human_homologene),]$`9606`  
+#  return(human_homologene)
+#})
+
+#install.packages("remotes")
+#remotes::install_github("oganm/homologene")
+#library(homologene)
+
+#human_gene_sets <- purrr::map(mouse_genes, ~{
+#  mouse_gene_vec <- .x$gene
+#  human_homologene <- homologene::homologene(mouse_gene_vec, inTax = 10090, outTax = 9606)
+#  # Use only unique human gene symbols
+#  human_genes <- human_homologene[!duplicated(human_homologene) | !duplicated(human_homologene), ]$`9606`
+#  return(human_genes)
+#})
+ 
+#names(human_gene_sets) <- names(mouse_genes)
+```
+
+
+```{r}
+#join human_cortex_with_ids with PC loadings by gene ID
+hgenes_with_pcs_fc <- human_cortex_with_ids %>% inner_join(pc1_fc_df, human_cortex_with_ids, by = "gene_id")
+hgenes_with_pcs_fc <- hgenes_with_pcs_fc %>% inner_join(pc2_fc_df)
+hgenes_with_pcs_fc <- hgenes_with_pcs_fc %>% inner_join(pc3_fc_df)
+hgenes_with_pcs_fc <- hgenes_with_pcs_fc %>% inner_join(pc4_fc_df)
+hgenes_with_pcs_fc <- hgenes_with_pcs_fc %>% inner_join(pc5_fc_df)
+hcortex_gsea <- select(human_cortex_with_ids, term_id = term_id, gene = gene_id)
+gsea_cortex_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = hgenes_with_pcs_fc, term2gene_df = hcortex_gsea))
+
+```
+
+```{r}
+ggplot(gsea_cortex_pcs, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Human Cortex Cell Types by PC 1-5",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+#join human_cerebellum_with_ids with PC loadings by gene ID
+hgenes_with_pcs_cb <- human_cerebellum_with_ids %>% inner_join(pc1_fc_df, human_cerebellum_with_ids, by = "gene_id")
+hgenes_with_pcs_cb <- hgenes_with_pcs_cb %>% inner_join(pc2_fc_df)
+hgenes_with_pcs_cb <- hgenes_with_pcs_cb %>% inner_join(pc3_fc_df)
+hgenes_with_pcs_cb <- hgenes_with_pcs_cb %>% inner_join(pc4_fc_df)
+hgenes_with_pcs_cb <- hgenes_with_pcs_cb %>% inner_join(pc5_fc_df)
+hcerebellum_gsea <- select(human_cerebellum_with_ids, term_id = term_id, gene = gene_id)
+gsea_cerebellum_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = hgenes_with_pcs_cb, term2gene_df = hcerebellum_gsea))
+```
+
+```{r}
+ggplot(gsea_cerebellum_pcs, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Human Cerebellum Cell Types by PC 1-5",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+#pc loadings by cell types boxplots to compare to heatmaps as a check
+
+#reshape dataframe to put PCs in one column and their values under a new column called "loading"
+hgenes_with_pcs_fc <- hgenes_with_pcs_fc %>%
+  pivot_longer(cols = starts_with("PC"),
+               names_to = "PC",
+               values_to = "loading")
+
+#create distribution of pc loadings by cell type
+ggplot(hgenes_with_pcs_fc, aes(x = term_id, y = loading)) +
+  geom_boxplot(outlier.shape = NA, color = "black") +
+  #geom_jitter(size= 0.5) +
+  facet_wrap(~ PC, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Distribution of PC Loadings by Cell Type in Frontal Cortex",
+       x = "Cell Type",
+       y = "Loading") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+```
+#FTD fold changes (cell types vs fold changes)
+#purkinje and PC1 loading?
+#do some reading and get better cell type markers for cerellebum (single cell sources?)
+#Allen Brain Atlas - do they have cerebellum markers?
+
+```{r}
+#plot distribution of pc loadings by cell types
+#reshape dataframe to put PCs in one column and their values under a new column called "loading" 
+hgenes_with_pcs_cb  <- hgenes_with_pcs_cb  %>%
+  pivot_longer(cols = starts_with("PC"),
+               names_to = "PC",
+               values_to = "loading")
+
+#create distribution of pc loadings by cell type
+ggplot(hgenes_with_pcs_cb, aes(x = term_id, y = loading)) +
+  geom_boxplot(outlier.shape = NA, color = "black") +
+  geom_jitter(size= 0.5) +
+  facet_wrap(~ PC, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Distribution of PC Loadings by Cell Type in Cerebellum",
+       x = "Cell Type",
+       y = "Loading") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+
+```
+
+```{r}
+#top 100 most enriched markers that intersect with our dataset
+#top 100 for each cluster, filter by our genes first
+
+#check what our genes are
+filtered_human_cere <- human_cere_tissue %>%
+  filter(gene %in% genes_with_pcs_cb$gene_name) %>%
+  left_join(gene_names, by = c("gene" = "gene_name"))
+
+
+#get first top 100 of each cluster
+top100_per_cluster <- filtered_human_cere %>%
+  filter(avg_log2FC > 1) %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 100, with_ties = FALSE) %>%  #with_ties = FALSE makes it so there are 100 per group 
+  ungroup()
+
+#lowest_fc <- filtered_human_cere %>%
+#  filter(avg_log2FC < -1) %>%
+#  group_by(cluster) %>%
+#  slice_min(avg_log2FC, n = 100, with_ties = FALSE) %>%
+#  ungroup()
+
+cere_gsea <- select(top100_per_cluster, term_id = cluster, gene = gene_id) %>% 
+  distinct()
+
+#for lowest_Fc
+#cere_gsea <- select(lowest_fc, term_id = cluster, gene = gene_id) %>% 
+#  distinct()
+
+genes_with_pcs_cb <-genes_with_pcs_cb %>%
+  pivot_wider(names_from = PC, values_from = loading)
+
+pcs <- paste0("PC", 1:5)
+gsea_cere_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = genes_with_pcs_cb, term2gene_df = cere_gsea))
+```
+
+```{r}
+#test how many genes are overlapping between clusters
+clusters <- split(cere_gsea, cere_gsea$term_id) %>%
+  map("gene")
+
+library(UpSetR)
+upset(fromList(clusters),nsets = 14)
+
+```
+```{r}
+#figure out algo that takes only looks + logfc and will give genes specific exclusively to each cell type
+cere_gsea_disjoint <-cere_gsea %>%
+  group_by(gene) %>%
+  tally() %>%
+  filter(n == 1) %>%
+  inner_join(cere_gsea, by = "gene") %>%
+  select(term_id, gene)
+
+pcs <- paste0("PC", 1:5)
+gsea_disjoin_cere_pcs <- purrr::map_dfr(pcs, ~run_pc_gsea(.x, pc_df = genes_with_pcs_cb, term2gene_df = cere_gsea_disjoint))
+
+```
+
+```{r}
+ggplot(gsea_disjoin_cere_pcs, aes(x = PC, y = cell_type, fill = NES)) +
+geom_tile(color = "white") +
+scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "NES") +
+geom_text(aes(label = sig_label), size = 5) +
+theme_minimal() +
+labs(title = "GSEA NES Heatmap of Human Cerebellum Cell Types by PC 1-5",
+x = "Principal Component", y = "Cell Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+```{r}
+pc_long <- cere_genes_with_ids %>%
+  pivot_longer(cols = starts_with("PC"),
+               names_to = "PC",
+               values_to = "loading")
+
+ggplot(pc_long, aes(x = factor(cluster), y = loading)) +
+  geom_boxplot() +
+  facet_wrap(~ PC, scales = "free_y") +
+  labs(
+    title = "Distribution of Principal Components by Cluster",
+    x = "Cluster",
+    y = "PC Loading"
+  ) +
+  theme_classic()
+
+```
+
+```{r}
+save(human_cere_tissue, file = "Human_cere_tissue.RData")
+```

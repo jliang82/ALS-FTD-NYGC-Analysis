@@ -1,0 +1,630 @@
+---
+title: "metadata_analysis"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-10-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+
+# Load necessary packages
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+library(tidyverse)
+library(janitor)
+```
+
+## R Markdown
+
+```{r}
+
+#read in data and clean column names
+ALS_data <- read_xlsx("/Users/judyliang/Documents/Towfique/ALS Consortium RNAseq Metadata 02212023.xlsx")
+
+ALS_data <- janitor::clean_names(ALS_data)
+```
+
+```{r}
+#finding number of distinct donors by diseases
+donor_disease <- select(ALS_data, external_subject_id, subject_group, subject_group_subcategory) %>%
+  distinct()
+
+#make tallies of disease groups
+donor_disease %>% 
+  group_by(subject_group) %>%
+  tally()
+
+```
+
+```{r}
+#distinct donors by disease subcategory
+donor_disease %>% 
+  group_by(subject_group_subcategory) %>%
+  tally() %>%
+  arrange(desc(n))
+```
+
+
+```{r}
+#number of samples (external_sample_id) and donors (external_subject_id) from each tissue (sample_source)
+tissue_counts <- ALS_data %>%
+group_by(sample_source) %>%
+summarize(
+sample_count = n_distinct(external_sample_id),
+donor_count = n_distinct(external_subject_id)
+)
+tissue_counts
+```
+
+```{r}
+#reformat data to create plot
+tissue_counts_long <- tissue_counts %>%
+  pivot_longer(cols = c(sample_count, donor_count), 
+               names_to = "Count_Type", 
+               values_to = "Count")
+
+# Use ggplot to create bar plots
+ggplot(tissue_counts_long, aes(x = sample_source, y = Count, fill = Count_Type)) +
+  geom_bar(stat = "identity", position = "dodge") +  # bars placed next to each other
+  labs(title = "Sample and Donor Counts by Tissue Source", 
+       x = "Tissue Source", 
+       y = "Count", 
+       fill = "Count Type") + theme(axis.text.x = element_text(hjust = 1)) + coord_flip()
+
+```
+
+
+
+```{r}
+# Filter data to keep only ALS, ALS/FTD, and FTD samples
+filtered_ALS_data <- ALS_data %>%
+filter(grepl('Classical/Typical ALS|Frontotemporal Dementia (FTD)', subject_group_subcategory))
+filtered_ALS_data 
+#ALS, FTD, ALS/FTD, ALS/Alzheimers, NC 
+#includes all different combinations that included ALS or FTD in any type of combination
+
+#ALS, ALS/FTD, FTD donors for each tissue type
+donor_count_filtered <- filtered_ALS_data %>%
+group_by(sample_source, subject_group_subcategory) %>% 
+summarize(donor_count = n_distinct(external_subject_id))
+#donor_count_filtered 
+```
+
+```{r}
+#create disease_short column for desired disease categories
+#add directly to original data (ALS_data)
+ALS_data <- ALS_data %>%
+mutate(disease_short = case_when(
+subject_group_subcategory == "Classical/Typical ALS" ~ "ALS",
+subject_group_subcategory == "Frontotemporal Dementia (FTD)" ~ "FTD",
+subject_group_subcategory == "Classical/Typical ALS, Frontotemporal Dementia (FTD)" ~ "ALS/FTD",
+subject_group_subcategory == "Classical/Typical ALS, Alzheimer's Disease (AD)" ~ "ALS/AD",
+grepl ("Classical/Typical ALS", subject_group_subcategory) ~ "ALS/other",
+(subject_group == "Non-Neurological Control" & is.na(subject_group_subcategory)) ~ "Control" ,
+TRUE ~ "Other"
+) )
+
+table(ALS_data$disease_short)
+
+select(ALS_data, subject_group, subject_group_subcategory, disease_short) %>%
+  distinct()
+```
+
+```{r}
+#redo donor counts for each tissue type, this time with disease_short as a column 
+#ALS, ALS/FTD, FTD donors for each tissue type
+donor_count_filtered2 <- ALS_data %>%
+group_by(sample_source, disease_short) %>% 
+summarize(donor_count = n_distinct(external_subject_id))
+donor_count_filtered2
+
+# Create a bar plot based on subject_group_subcategory
+ggplot(donor_count_filtered2, aes(x = sample_source, y = donor_count, fill = disease_short)) +geom_bar(stat = "identity", position = "dodge") +  
+  labs(title = "Sample and Donor Counts by Disease Group",
+       x = "Sample_source",
+       y = "Count",
+       fill = "Count Type") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_flip() +  guides(fill="none") + facet_wrap(~disease_short, scales="free_x", nrow = 2)
+```
+
+
+```{r}
+#harmonize frontal cortex tissues
+donor_count_filtered2 <- donor_count_filtered2 %>%
+  mutate(sample_source = ifelse(grepl("Cortex_Frontal", sample_source, ignore.case = TRUE), "Cortex_Frontal", sample_source))
+#donor_count_filtered2
+
+#get rid of cell_lines from source_sample, argument that will get rid of any sample_source that has less than 20. 
+tissue_list_reduced <-donor_count_filtered2 %>%
+  group_by(sample_source) %>%
+  summarize(n = sum(donor_count)) %>%
+  filter(n > 20) %>%
+  arrange(n)
+#tissue_list_reduced 
+
+# Count donors for ALS, ALS/FTD, FTD by tissue with frontal cortex combined
+donor_count_filtered2 %>%
+filter(sample_source %in% tissue_list_reduced$sample_source) %>%
+mutate(tissue = factor(sample_source, levels = tissue_list_reduced$sample_source)) %>%
+ggplot(aes(x = tissue, y = donor_count, fill = disease_short)) +geom_bar(stat = "identity", position = "dodge") +  
+  labs(title = "Sample and Donor Counts by Disease Group",
+       x = "Sample_source",
+       y = "Count",
+       fill = "Count Type") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + guides(fill="none") +
+ coord_flip() + facet_wrap(~disease_short, scales="free_x", nrow = 1)
+
+```
+
+ 
+ 
+```{r}
+#restart from ALS_data again and start by making all types of cortex frontals into one (Cortex_Frontal (447), Cortex_Frontal_BA44 (23), Cortex_Frontal_BA46 (24) should result in total count of 494
+
+ #list of external_subject_id for each disease type (by disease_short categories)
+ALS_filtered_combined_cortex <- ALS_data %>%
+  mutate(sample_source = ifelse(grepl("Cortex_Frontal", sample_source, ignore.case = TRUE),  "Cortex_Frontal", sample_source))
+
+# list of unique external_sample_id by disease short and in cerebellum and frontal cortex
+fc_cb_samples_list_by_disease <- ALS_filtered_combined_cortex %>%
+  select(external_sample_id, disease_short, sample_source) %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal") %>%
+  arrange(sample_source, disease_short) %>%
+  distinct(external_sample_id, .keep_all = TRUE)
+
+fc_cb_samples_list_by_disease 
+#only frontal cortex and cerebellum tissues:
+#ALS: 453; ALS/AD: 31; ALS/FTD: 46; ALS/other: 35; Control: 122; FTD:104; Other: 81
+
+#check for duplicates
+#samples_list_by_disease_and_tissue[duplicated(samples_list_by_disease_and_tissue$external_sample_id), ]
+```
+
+
+```{r}
+#filter the data to show only the rows where expanded_30 is true
+expanded_30_data <- ALS_data %>%
+filter(expanded_30 == "Yes")
+#finding donors with C9orf72 expansions:
+donors_with_expanded_30 <- nrow(expanded_30_data)
+print(donors_with_expanded_30)
+```
+
+```{r}
+#showing the distinct donors with C9orf72 expansions in table:
+donor_expanded_30_data <- expanded_30_data %>%
+  select(external_subject_id) %>%  # Select only the external_subject_id column
+  distinct() 
+donor_expanded_30_data
+```
+
+```{r}
+#examining the breakdown of the frequency of C9orf72 expansions among disease groups
+disease_groups_with_expanded_30 <- expanded_30_data %>%
+group_by(disease_short) %>%
+summarize(donor_count = n_distinct(external_subject_id))
+disease_groups_with_expanded_30
+```
+
+
+```{r}
+#plotting donor count by subject_group_subcategory
+ggplot(disease_groups_with_expanded_30, aes(x = disease_short, y = donor_count, fill = disease_short)) +
+  geom_bar(stat = "identity") +  # Create bars for counts
+  labs(title = "Donors with Expanded C9orf72 Count by Disease Group Subcategory",
+       x = "Disease Group Subcategory",
+       y = "Donor Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+        #legend.position = "bottom", 
+        #legend.direction = "horizontal",  
+        #legend.box = "horizontal")  
+
+```
+
+```{r}
+#Comparing RIN, age of death, and PMI between disease groups
+comparison_between_disease_groups <- ALS_filtered_combined_cortex %>%
+  select(external_subject_id, disease_short, sample_source, rin, age_at_death, post_mortem_interval_in_hours, sex, prep, site_specimen_collected)
+
+#comparison_between_disease_groups
+#2863 samples
+```
+
+
+```{r}
+#group by disease_short and find number of distinct external subject ids
+subject_id_counts <- 
+comparison_between_disease_groups %>%
+  group_by(disease_short, sample_source) %>%
+  tally() 
+  #distinct()
+  #(subject_count = n_distinct(external_subject_id))
+
+#subject_id_counts
+
+
+#ALS	1660			
+#ALS/AD	109			
+#ALS/FTD	165			
+#ALS/other	127			
+#Control	411			
+#FTD	149			
+#Other	242	
+```
+
+
+```{r}
+#check distribution of sample by diseases in cerebellum and frontal cortex
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal") %>%
+  group_by(disease_short, sample_source) %>%
+  tally() %>%
+  pivot_wider(names_from = sample_source, values_from = n)
+```
+
+```{R}
+#check distribution of samples from sites
+ALS_data %>%
+  filter(sample_source %in% c("Cortex_Frontal", "Cerebellum")) %>%
+  group_by(disease_short, site_specimen_collected) %>%
+  tally() %>%
+  pivot_wider(names_from = disease_short, values_from = n)
+```
+
+```{r}
+#merge counts back with data 
+data_with_counts <- left_join(comparison_between_disease_groups, subject_id_counts)
+data_with_counts
+
+data_with_counts %>%
+  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal") %>%
+  group_by(disease_short, sample_source) %>%
+  tally() %>%
+  pivot_wider(names_from = sample_source, values_from = n)
+```
+
+```{r}
+#mutate non-numerical values of data_with_counts for age_at_death (which contains "90 or older", "NA", and "unknown")
+ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+  mutate(age_at_death = case_when(
+age_at_death == "90 or older" ~ 90,
+age_at_death %in% c("Not Applicable", "Unknown") ~ NA_real_,
+TRUE ~ as.numeric(age_at_death)               
+))
+
+print(sum(is.na(ALS_filtered_combined_cortex$age_at_death))) 
+table(is.na(ALS_filtered_combined_cortex$age_at_death))
+ #142
+print(sum(is.na(ALS_filtered_combined_cortex$age_at_death) & ALS_filtered_combined_cortex$sample_source == "Cerebellum", na.rm = TRUE)) #83
+print(sum(is.na(ALS_filtered_combined_cortex$post_mortem_interval_in_hours) & ALS_filtered_combined_cortex$sample_source == "Cortex_Frontal", na.rm = TRUE)) #218
+
+#ALS_filtered_combined_cortex %>%
+#  filter(sample_source == "Cerebellum" | sample_source == "Cortex_Frontal") %>%
+#  group_by(disease_short, sample_source) %>%
+#  tally() %>%
+#  pivot_wider(names_from = sample_source, values_from = n)
+```
+
+
+```{r}
+#cf: age at death 
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cortex_Frontal") %>%
+ggplot( aes(x = disease_short, y = age_at_death)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color= NA, fill = NA) +
+  labs(title = "Frontal Cortex: Age of Death Across Disease Groups",
+       x = "Disease Group",
+       y = "Age at Death") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+```{r}
+#cb: age at death
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum") %>%
+ggplot( aes(x = disease_short, y = age_at_death)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color= NA, fill = NA) +
+  labs(title = "Cerebellum: Age of Death Across Disease Groups",
+       x = "Disease Group",
+       y = "Age at Death") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+
+
+```{r}
+#mutate non-numerical values of data_with_counts for post_mortem_interval_in_hours (which contains "90 or older", "NA", and "unknown")
+#data_with_counts <- data_with_counts %>%
+#  mutate(post_mortem_interval_in_hours = case_when(
+#post_mortem_interval_in_hours %in% c("Not Applicable", "Unknown") ~ NA_real_,
+#TRUE ~ as.numeric(post_mortem_interval_in_hours)               
+#  )) 
+  #filter(!is.na(post_mortem_interval_in_hours)) 
+
+#data_with_counts %>%
+#  mutate(dis = paste0(disease_short, "\n(", subject_count, ")")) %>%
+#ggplot(aes(x = disease_short, y = post_mortem_interval_in_hours)) +
+#  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+#  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+#  labs(title = "Post-Mortem Interval Across Disease Groups",
+#       x = "Disease Group",
+#       y = "Post-Mortem Interval (hours)") +
+#  theme_classic() +
+#  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#  guides(colour = "none")
+```
+
+
+```{r}
+#PMI 
+ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+  mutate(post_mortem_interval_in_hours = case_when(
+post_mortem_interval_in_hours %in% c("Not Applicable", "Unknown") ~ NA_real_,
+TRUE ~ as.numeric(post_mortem_interval_in_hours)               
+  )) 
+
+print(sum(is.na(ALS_filtered_combined_cortex$post_mortem_interval_in_hours)))
+table(is.na(ALS_filtered_combined_cortex$post_mortem_interval_in_hours))
+#1130 (Cerebellum: 83, Frontal Cortex: 218)
+print(sum(is.na(ALS_filtered_combined_cortex$post_mortem_interval_in_hours) & ALS_filtered_combined_cortex$sample_source == "Cerebellum", na.rm = TRUE)) #83
+print(sum(is.na(ALS_filtered_combined_cortex$post_mortem_interval_in_hours) & ALS_filtered_combined_cortex$sample_source == "Cortex_Frontal", na.rm = TRUE)) #218
+
+
+#PMI: cf
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cortex_Frontal") %>%
+ggplot(aes(x = disease_short, y = post_mortem_interval_in_hours)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: Post-Mortem Interval Across Disease Groups",
+       x = "Disease Group",
+       y = "Post-Mortem Interval (hours)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+```{r}
+#PMI: cb
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum") %>%
+ggplot(aes(x = disease_short, y = post_mortem_interval_in_hours)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: Post-Mortem Interval Across Disease Groups",
+       x = "Disease Group",
+       y = "Post-Mortem Interval (hours)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+
+```
+
+
+```{r}
+
+# #check for NA values
+# sum(is.na(data_with_counts$rin))
+# 
+# #filter out NA values in rin column
+# data_with_counts <- data_with_counts %>%
+#   mutate(rin = case_when(
+# rin %in% c("NA") ~ NA_real_,
+# TRUE ~ as.numeric(rin)               
+#   ))
+#   #filter(!is.na(rin)) 
+# 
+# #frontal cortex and cerebellum (side by side)
+# # with facet
+# data_with_counts %>%
+#   filter(sample_source %in% c("Cortex_Frontal", "Cerebellum") ) %>%
+# ggplot(aes(x = disease_short, y = rin)) +
+#   geom_boxplot(alpha = 0.6, color = "black", outlier.colour =  NA, fill = NA) +
+#   geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+#   labs(title = "RIN Across Disease Groups",
+#        x = "Disease Group",
+#        y = "RIN") +
+#   theme_classic() +
+#   guides(colour = "none") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#   facet_wrap(~sample_source)
+ 
+```
+
+```{r}
+#rin 
+ALS_filtered_combined_cortex <- ALS_filtered_combined_cortex %>%
+  mutate(rin = case_when(
+rin %in% c("NA") ~ NA_real_,
+TRUE ~ as.numeric(rin)               
+  )) 
+
+print(sum(is.na(ALS_filtered_combined_cortex$rin)))
+table(is.na(ALS_filtered_combined_cortex$rin))
+#260 (Cerebellum - 12, Frontal cortex -33)
+print(sum(is.na(ALS_filtered_combined_cortex$rin) & ALS_filtered_combined_cortex$sample_source == "Cerebellum", na.rm = TRUE)) #12
+print(sum(is.na(ALS_filtered_combined_cortex$rin) & ALS_filtered_combined_cortex$sample_source == "Cortex_Frontal", na.rm = TRUE)) #33
+
+#frontal cortex
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cortex_Frontal") %>%
+ggplot(aes(x = disease_short, y = rin)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: RIN Across Disease Groups",
+       x = "Disease Group",
+       y = "RIN") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+```
+
+```{r}
+#rin: cerebellum
+ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum") %>%
+ggplot(aes(x = disease_short, y = rin)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: Post-Mortem Interval Across Disease Groups",
+       x = "Disease Group",
+       y = "Post-Mortem Interval (hours)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(colour = "none")
+
+```
+
+
+```{r}
+#site specimen collected
+cf_site_counts <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cortex_Frontal") %>%
+  group_by(disease_short, site_specimen_collected) %>%
+  tally()
+
+cf_site_counts %>%
+#ggplot(aes(x = site_specimen_collected , y = cf_site_counts)) +
+ggplot(aes(x = disease_short , y = n, fill = site_specimen_collected)) +
+  geom_jitter(aes(color = site_specimen_collected), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: Collection Site Across Disease Groups",
+       x = "Disease Group",
+       y = "Collection Site") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+  
+
+```
+
+```{r}
+cf_site_counts %>%
+  group_by(disease_short) %>%
+  mutate(proportion = n / sum(n)) %>%
+ggplot(aes(x = disease_short , y = proportion, fill = site_specimen_collected)) +
+  geom_jitter(aes(color = site_specimen_collected), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: Collection Site Across Disease Groups",
+       x = "Disease Group",
+       y = "Proportion of Total from Collection Site") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+cf_site_counts %>%
+  group_by(disease_short) %>%
+  mutate(proportion = n / sum(n)) %>%
+ggplot(aes(x = site_specimen_collected , y = proportion, fill = disease_short)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Frontal Cortex: Collection Sites",
+       x = "Collection Site",
+       y = "Samples (Proportion out of total)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+cb_site_counts <- ALS_filtered_combined_cortex %>%
+  filter(sample_source == "Cerebellum") %>%
+  group_by(disease_short, site_specimen_collected) %>%
+  tally()
+
+cb_site_counts %>%
+  group_by(disease_short) %>%
+  mutate(proportion = n / sum(n)) %>%
+ggplot(aes(x = site_specimen_collected , y = proportion, fill = disease_short)) +
+  geom_jitter(aes(color = disease_short), width = 0.2, size = 1.5, alpha = 0.7) +
+  geom_boxplot(alpha = 0.6, color = "black", outlier.color = NA, fill = NA) +
+  labs(title = "Cerebellum: Collection Sites",
+       x = "Collection Site",
+       y = "Samples (Proportion out of total)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+#cerebellum_counts <- data_with_counts %>%
+#  filter(sample_source == "Cerebellum") %>%
+#  group_by(disease_short, external_subject_id) %>%
+#  #summarise(rin = mean(rin, na.rm = TRUE), .groups = "drop") %>%
+#  group_by(disease_short) %>%
+#  mutate(unique_count = n()) %>%
+#  ungroup()
+
+#frontal_cortex_counts <- data_with_counts %>%
+#  filter(sample_source == "Cortex_Frontal") %>%
+#  group_by(disease_short, external_subject_id) %>%
+#  #summarise(rin = mean(rin, na.rm = TRUE), .groups = "drop") %>%
+#  group_by(disease_short) %>%
+#  mutate(unique_count = n()) %>%
+#  ungroup()
+
+#p1 <- ggplot(cerebellum_counts, aes(x = disease_short, y = rin)) +
+#  geom_boxplot() xxxd+
+#  geom_jitter(width = 0.2, aes(color = disease_short)) +  # Color points by disease
+#  labs(title = "Cerebellum Samples", y = "RIN", x = "Disease Short") +
+#  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + guides (fill= "None")
+
+#p2 <- ggplot(frontal_cortex_counts, aes(x = disease_short, y = rin)) +
+#  geom_boxplot() +
+#  geom_jitter(width = 0.2, aes(color = disease_short)) +  # Color points by disease
+#  labs(title = "Frontal Cortex Samples", y = "RIN", x = "Disease Short") +
+#  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + guides (fill= "None")
+
+#combined_plot <- p1 + p2
+#combined_plot
+```
+
+```{r}
+list2_duplicates <- ALS_filtered_combined_cortex$external_sample_id[duplicated(ALS_filtered_combined_cortex$external_sample_id)]
+print(list2_duplicates)
+
+```
+
+```{r}
+list_duplicates <- ALS_data$external_sample_id[duplicated(ALS_data$external_sample_id)]
+print(list_duplicates)
+```
+
+```{r}
+#get rid of duplicates according to external_sample)id
+ALS_filtered_combined_cortex <- distinct(ALS_filtered_combined_cortex, external_sample_id, .keep_all = TRUE)
+```
+
+```{r}
+#save objects as RData files:
+save(fc_cb_samples_list_by_disease, file = "fc_cb_samples.RData")
+save(ALS_filtered_combined_cortex, file = "ALS_filtered_combined_cortex.RData")
+#save(pca_df, file = "pca_results.RData")
+#save(data_with_counts, file = "sample_list_metadata.Rdata")
+#save(samples_list_by_disease_and_tissue, file = "sample_list_disease_tissue.RData")
+
+```
+ 
+
+
+
+
+
+
+
+
+
+
+
